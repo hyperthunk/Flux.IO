@@ -3,17 +3,16 @@
 module CoreTests =
 
     open System
-    open System.Collections.Generic
     open System.Collections.Concurrent
     open System.IO
     open System.Threading
     open System.Threading.Tasks
     open Expecto
-    open Expecto.Logging
     open Flux.IO.Collections
     open Flux.IO.Core
+    open Flux.IO.Core.Flow
     open FsCheck
-    open FsCheck.Experimental
+    open FSharpPlus
     open FSharp.HashCollections
 
     module private TestEnv =
@@ -222,12 +221,18 @@ module CoreTests =
                 let! p  = genPayload
                 let! s  = Gen.choose(0, Int32.MaxValue) |> Gen.map int64
                 let! tc = genTraceContext
-                let! hdrs = genHashMap (Gen.elements ["k1";"k2";"foo";"bar";"hdr"]) (Gen.elements ["v1";"v2";"zzz";"alpha"])
+                let! hdrs = 
+                    genHashMap 
+                        (Gen.elements ["k1"; "k2"; "foo"; "bar"; "hdr"]) 
+                        (Gen.elements ["v1"; "v2"; "zzz"; "alpha"])
                 let! attrs =
                     gen {
-                        let! keys = Gen.listOf (Gen.elements ["a";"b";"c";"payload";"seq"])
-                        let! vals = Gen.listOf (Gen.elements [ box 1; box "v"; box 42; box true; box 0.5 ])
-                        let pairs = List.zip (List.truncate (List.length vals) keys) vals
+                        let! n = Gen.choose(1, 5)
+                        let! keys = 
+                            Gen.elements ["a"; "b"; "c"; "payload"; "seq"] |> Gen.listOfLength n
+                        let! vals = 
+                            Gen.elements [ box 1; box "v"; box 42; box true; box 0.5 ] |> Gen.listOfLength n
+                        let pairs = List.zip keys vals
                         return pairs |> List.fold (fun acc (k,v) -> HashMap.add k v acc) HashMap.empty
                     }
                 let! cost = genCost
@@ -486,6 +491,143 @@ module CoreTests =
             ]
 
     [<Tests>]
+    let envelopeTests =
+        testList "Envelope" [
+            testPropertyWithConfig 
+                    stdConfig 
+                    "mapEnvelope preserves metadata" <| fun (env: Envelope<int>) ->
+
+                let f x = x + 1
+                let mapped = mapEnvelope f env
+
+                Expect.equal mapped.SeqId env.SeqId "Expected equal seqIds"
+                Expect.equal mapped.SpanCtx.TraceId env.SpanCtx.TraceId "Expected equal traceIds"
+
+                let s1 = HashMap.keys mapped.Attrs |> Set.ofSeq
+                let s2 = HashMap.keys env.Attrs |> Set.ofSeq
+                Expect.isEmpty (Set.difference s1 s2) "Expected equal attribute keys"
+
+                // whilst we *could* check reference equality, HashMap makes no guarantees 
+                // object the order of value elements when calling `toSeq`
+                let l1 = HashMap.values mapped.Attrs |> List.ofSeq
+                let l2 = HashMap.values env.Attrs |> List.ofSeq
+                Expect.equal l1.Length l2.Length "Expected equal attribute value counts"
+
+                Expect.equal mapped.Cost env.Cost "Expected equal cost"
+
+            testPropertyWithConfig 
+                    stdConfig 
+                    "mapEnvelope transforms payload correctly" <| fun (env: Envelope<int>) ->
+                let f x = x * 2
+                let mapped = mapEnvelope f env
+                mapped.Payload = env.Payload * 2
+        ]
+
+    [<Tests>]
+    let streamProcessorTests =
+        testList "StreamProcessor" [
+
+            testPropertyWithConfig 
+                stdConfig 
+                "lift emits exactly one envelope with transformed payload" <| 
+                fun (env: Envelope<int>, f: int -> int) ->
+                    let proc = StreamProcessor.lift f
+                    let env0,metrics,_,_ = mkEnv()
+                    let resVT = 
+                        StreamProcessor.runProcessor proc env 
+                        |> Flow.run env0 CancellationToken.None
+                    
+                    let res = resVT.Result
+                    match res with
+                    | StreamCommand.Emit outEnv -> outEnv.Payload = f env.Payload
+                    | _ -> false
+
+            testPropertyWithConfig 
+                stdConfig 
+                "filter passes subset satisfying predicate" <|
+                fun (env: Envelope<int>, pred: int -> bool) ->
+                    let proc = StreamProcessor.filter pred
+                    let env0,_,_,_ = mkEnv()
+                    let out = 
+                        StreamProcessor.runProcessor proc env 
+                        |> Flow.run env0 CancellationToken.None 
+                        |> fun vt -> vt.Result
+                    
+                    match pred env.Payload, out with
+                    | true, StreamCommand.Emit o -> o.Payload = env.Payload
+                    | false, StreamCommand.RequireMore -> true
+                    | _ -> false
+
+            testCase "stateful emits only when Some returned" <| fun _ ->
+                // Sum every 3 numbers
+                let collector =
+                    StreamProcessor.stateful (0,0) (fun (sum,count) x ->
+                        let sum' = sum + x
+                        let count' = count + 1
+                        if count' = 3 then 
+                            (0,0), Some sum' 
+                        else (sum', count'), None
+                    )
+
+                let env0, _, _, _ = mkEnv()
+                let mkEnv i =
+                    {
+                        Payload = i
+                        Headers = HashMap.empty
+                        SeqId = int64 i
+                        SpanCtx = { TraceId="t"; SpanId="s"; Baggage=HashMap.empty }
+                        Ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+                        Attrs = HashMap.empty
+                        Cost = { Bytes = 0; CpuHint = 0.0 }
+                    }
+                    
+                let inputs = [1;2;3;4;5;6;7]
+                let outputs =
+                    inputs
+                    |> List.map (fun i -> 
+                        StreamProcessor.runProcessor collector (mkEnv i) 
+                        |> Flow.run env0 CancellationToken.None 
+                        |> fun vt -> vt.Result)
+                
+                let emittedSums =
+                    outputs
+                    |> List.choose (function StreamCommand.Emit e -> Some e.Payload | _ -> None)
+                Expect.sequenceEqual emittedSums [1+2+3; 4+5+6] "Should emit two sums (7 incomplete)"
+
+            testCase "withEnv accesses metrics and increments counter" <| fun _ ->
+                let proc =
+                    StreamProcessor.withEnv (fun env (x:int) ->
+                        flow {
+                            env.Metrics.RecordCounter("hit", HashMap.empty, 1L)
+                            return x + 10
+                        })
+                
+                let env0,metrics,_,_ = mkEnv()
+                let envIn =
+                    {
+                        Payload = 5
+                        Headers = HashMap.empty
+                        SeqId = 1L
+                        SpanCtx = { TraceId="t"; SpanId="s"; Baggage=HashMap.empty }
+                        Ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+                        Attrs = HashMap.empty
+                        Cost = { Bytes = 0; CpuHint = 0.0 }
+                    }
+                let res = 
+                    StreamProcessor.runProcessor proc envIn 
+                    |> Flow.run env0 CancellationToken.None 
+                    |> fun vt -> vt.Result
+                
+                match res with
+                | Emit outEnv ->
+                    Expect.equal outEnv.Payload 15 "Transformed"
+                    let hits = metrics.Counters.TryGetValue "hit" |> function | true,v -> v | _ -> 0L
+                    Expect.equal hits 1L "Counter incremented"
+                | _ -> failwith "Expected Emit"
+
+        ]
+
+    [<Tests>]
     let unitTests = testList "UnitTests" [
         test "Basic Envelope Creation" {
             let envelope = Envelope<_>.create 1 "test payload"
@@ -504,8 +646,113 @@ module CoreTests =
         }
     ]
 
+    module StatefulSumModel =
+        // Model: stateful processor that sums groups of size N (here N=3) -> emits sum
+        type ModelState =
+            { Buffer : int list
+              Emitted : int list } 
+
+        let N = 3
+
+        // System under test: using stateful StreamProcessor identical to code in testCase earlier
+        let mkProcessor () =
+            StreamProcessor.stateful (0,0) (fun (sum,count) x ->
+                let sum' = sum + x
+                let count' = count + 1
+                if count' = N then 
+                    (0,0), Some sum' 
+                else (sum', count'), None
+            )
+
+        type Cmd =
+            | Add of int
+
+        [<AbstractClass>]
+        type Sut() = 
+            abstract member Run: (Cmd list) -> bool
+
+        // Generator for commands
+        let genCmd = Arb.generate<int> |> Gen.map (fun i -> Add (abs i % 50))
+
+        // Apply command to model
+        let stepModel cmd (state: ModelState) =
+            match cmd with
+            | Add x ->
+                let buf' = x :: state.Buffer
+                if List.length buf' = N then
+                    { Buffer = []
+                      Emitted = (List.sum buf') :: state.Emitted }
+                else
+                    { state with Buffer = buf' }
+
+        // Execute command on SUT and compare invariants
+        let spec() =
+            let proc = mkProcessor ()
+            let env0,_,_,_ = TestEnv.mkEnv()
+            let mutable currentState = { Buffer = []; Emitted = [] }
+            let mutable sutOutputs : int list = []
+
+            let apply cmd =
+                let x = match cmd with Add v -> v
+                let env =
+                    {
+                        Payload = x
+                        Headers = HashMap.empty
+                        SeqId = int64 x
+                        SpanCtx = { TraceId="t"; SpanId="s"; Baggage=HashMap.empty }
+                        Ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+                        Attrs = HashMap.empty
+                        Cost = { Bytes = 0; CpuHint = 0.0 }
+                    }
+                
+                // step SUT
+                let res = 
+                    StreamProcessor.runProcessor proc env 
+                    |> Flow.run env0 CancellationToken.None 
+                    |> fun vt -> vt.Result
+                
+                match res with
+                | StreamCommand.Emit e -> sutOutputs <- e.Payload :: sutOutputs
+                | _ -> ()
+                
+                // step model
+                currentState <- stepModel cmd currentState
+                
+                // invariants:
+                //  1. Emitted counts match
+                //  2. Each emitted value equals sum of some disjoint chunk of size N
+                let invariant1 = currentState.Emitted.Length = sutOutputs.Length
+                let invariant2 =
+                    (List.length sutOutputs = List.length currentState.Emitted) &&
+                    (List.forall2 (=) (List.rev currentState.Emitted) (List.rev sutOutputs))
+                invariant1 && invariant2
+
+            // Return commands and execution predicate
+            { new Sut() with
+                member __.Run(ops: List<Cmd>) = ops |> List.forall apply
+            }
+
+        let propMachine =
+            gen {
+                let! cmds = Gen.listOf genCmd
+                let specInstance = spec()
+                return (cmds, specInstance)
+            }
+            |> Arb.fromGen
+            |> (flip Prop.forAll)
+                (fun (cmds, specInstance: Sut) -> specInstance.Run cmds)
+
+    [<Tests>]
+    let modelBasedTests =
+        testList "Model-Based (Stateful Sum Machine)" [
+            testPropertyWithConfig fastConfig "stateful sum model invariants hold" StatefulSumModel.propMachine
+        ]
+
     [<Tests>]
     let coreTests = testList "Core Tests" [
         unitTests
+        envelopeTests
         flowTests
+        streamProcessorTests
+        modelBasedTests
     ]
