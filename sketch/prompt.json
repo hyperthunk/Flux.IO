@@ -16,8 +16,8 @@
     "required-outputs": {
         "design": "a complete design overview in markdown format, suitable for publication as github documentation",
         "core-types": "F# types that are common across layers and modules, in a file named Core.fs",
-        "pipeline-implementations": "F# implementations of the pipeline layers, stages, and components",
-        "other-implementations": "F# implementations of other components that are needed to support the architecture",
+        "pipeline-implementations": "files containing F# implementations of the pipeline layers, stages, and components",
+        "other-implementations": "files containing F# implementations of other components that are needed to support the architecture",
         "test-plan": "you are NOT required to write the tests as part of this task - instead please produce a test plan in a markdown file that describes how you would test the components you have implemented"
     },
     "in-scope": {
