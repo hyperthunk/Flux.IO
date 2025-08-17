@@ -5,6 +5,7 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="Collections.fs" />
     <Compile Include="Core.fs" />
   </ItemGroup>
   <Import Project="..\..\.paket\Paket.Restore.targets" />

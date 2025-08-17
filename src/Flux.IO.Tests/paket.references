@@ -6,6 +6,6 @@ FSharp.Control.AsyncSeq
 
 group Test
     Expecto
+    Expecto.FsCheck
     Microsoft.NET.Test.Sdk
     YoloDev.Expecto.TestSdk
-    Expecto.FsCheck
