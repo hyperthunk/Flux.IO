@@ -1,0 +1,10 @@
+FSharp.HashCollections
+FsToolkit.ErrorHandling
+FSharpPlus
+FSharp.Control.TaskSeq
+FSharp.Control.AsyncSeq
+group Test
+Expecto
+Microsoft.NET.Test.Sdk
+YoloDev.Expecto.TestSdk
+Expecto.FsCheck
