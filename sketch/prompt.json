@@ -1,0 +1,361 @@
+{
+    "task": "api design & implementation blueprint",
+    "context": "building a non-blocking, stream processing framework",
+    "problem": "allow systems to 'annotate' their data, mapping it to semantic ontologies - use AI/ML to automate mapping generation",
+    "tasks": {
+        "layering": ["how to keep Span/Memory<T> and Buffer<T> stuff with async processing",
+                     "how to link the async buffered raw data pipelines with NSoft.Json",
+                     "how to implement patterns that allow data to change over layers",
+                     "example: consuming raw data into a buffer, then parsing a json schema",
+                     "then passing the whole schema downstream [example of aggregation]"
+                    ],
+        "interaction-styles": ["pipes", "message-exchange", "finite-state-machines"],
+        "api-design": ["DSLs", "monads for implementation blocks", "async loops", "compasability"],
+        "robustness": ["figure out how to manage the lifecycle of async operations and their associated resources"]
+    },
+    "solution-sketch": {
+        "overview": "data is mapped to a target ontology and the mappings are used to generate code and other artefacts used in integration",
+        "processes": ["onboarding-mapping", "code-generation", {"runtime-integrations": ["consumer", "producer"]}],
+        "process-details": {
+            "ontology-management": {
+                "description": "manage multiple ontologies and provide mappings between them",
+                "overview": {
+                    "mapping-ontologies": "provide a unified view of the data across different ontologies",
+                    "ingest-ontologies": "provide a semantic model for ingested data - these are 'A-box' ontologies",
+                    "business-ontologies": "provide a ground-truth for business data - these are 'T-box' ontologies"
+                },
+                "phases": [
+                    {
+                        "id": 1,
+                        "name": "ontology-discovery",
+                        "description": ["Discover existing ontologies in the landscape",
+                                        "a. Use AI/ML to identify and extract ontologies from existing data sources",
+                                        "b. Map discovered ontologies to the global knowledge graph"],
+                        "components": ["TBC"]
+                    },
+                    {
+                        "id": 2,
+                        "name": "ontology-mapping",
+                        "description": ["Use AI/ML to generate mappings between ontologies"],
+                        "components": ["TBC"]
+                    },
+                    {
+                        "id": 3,
+                        "name": "ontologies-as-training-data",
+                        "description": ["Use ontologies to generate training data for AI document-ingest tools"],
+                        "components": ["TBC"]
+                    }
+                ]
+            },
+            "onboarding-mapping": {
+                "description": "the process of mapping existing data to the target ontology",
+                "overview": "multi-phase onboarding process that maps hetergeneous data to a target ontology",
+                "phases": [
+                    {
+                        "id": 1,
+                        "name": "data discovery: concept-schemes",
+                        "description": ["Generate x2 Mork concept schemes from the data (or schema, when I get around to that bit)",
+                                       "a. Taxonomy (entity names and their relationships in different roles within the scheme)",
+                                       "b. Representation (differentiates between entity, collection/array, and attribute, plus data types)"],
+                        "components": ["mork-ontology", "MorkSharp.Nanu"]
+                    },
+                    {
+                        "id": 2,
+                        "name": "data discovery: ontology-generation",
+                        "description": ["Generate a 'data-' 'ontology from the output of phase (1)",
+                                        " a. annotate the axioms in the ontology with meta-data pointing back to the mork concept schemes"],
+                        "components": ["mork-ontology", "MorkSharp.Nanu"]
+                    },
+                    {
+                        "id": 3,
+                        "name": "data discovery: lexicon-generation",
+                        "description": ["Generate a 'data-' 'lexicon' from the output of phase (1) and (2)",
+                                        " a. annotate the lexicon entries with meta-data pointing back to the mork concept schemes"],
+                        "components": ["mork-ontology", "MorkSharp.Dict"]
+                    },
+                    {
+                        "id": 4,
+                        "name": "data discovery: bayes-classification",
+                        "description": ["Run the lexicon through a bayes classification pipeline (local code runs this) against the target ontology",
+                                        "i. pipeline is pre-trained on all successful mappings to date",
+                                        "ii. first sets of training data produced by hand"],
+                        "components": ["mork-ontology", "MorkSharp.MLPipelines"]
+                    },
+                    {
+                        "id": 5,
+                        "name": "data discovery: lexical-mapping",
+                        "description": ["Run the lexicon through a hybrid classification pipeline (local code) using string distance and soundex"],
+                        "components": ["mork-ontology", "MorkSharp.MLPipelines"]
+                    },
+                    {
+                        "id": 6,
+                        "name": "data discovery: mapping-generation",
+                        "description": ["Pass the artefacts to an LLM and ask for a lexical and semantic analysis to complete/complement the mappings",
+                                        "use a simple file format to reduce token usage",
+                                        "Take the LLM mapping data and reconstitute into a mork mapping ontology"],
+                        "components": ["mork-ontology", "MorkSharp.Agent"]
+                    },
+                    {
+                        "id": 7,
+                        "name": "data discovery: user-verification",
+                        "description": ["Human-in-the-loop verification of the mappings"],
+                        "components": ["TBC"]
+                    },
+                    {
+                        "id": 8,
+                        "name": "mapping-evaluation",
+                        "description": ["Evaluate the quality of the generated mappings",
+                                        "a. Use AI/ML to assess the accuracy and completeness of the mappings"],
+                        "components": ["TBC"]
+                    },
+                    {
+                        "id": 9,
+                        "name": "data discovery: feedback-loop+training-loop",
+                        "description": ["Establish a feedback loop with users to continuously improve the mappings",
+                                        "Incorporate user feedback into the training data for the classification pipelines",
+                                        "Use active learning to improve the classification models over time",
+                                        "Merge generated ontologies into a wider graph of growing knowledge",
+                                        "Produce embeddings and representations for use in GraphRAG"],
+                        "components": ["TBC"]
+                    }
+                ]
+            },
+            "code-generation": {
+                "description": "the process of generating code from the mapped data",
+                "inputs": ["ontologies", "concept-schemes", "mappings"],
+                "outputs": {
+                    "ingress-support": {
+                        "description": "support for ingesting data into the system",
+                        "implementation-status": "see individual artefacts",
+                        "artefacts": {
+                            "rml-mappings": {
+                                "description": "RML mappings for ingesting data into an RDF graph (or database)",
+                                "implementation-status": "in-progress",
+                                "notes": ["RML mappings are used to map data from the source to the target ontology",
+                                         "We cannot produce RML mappings directly, since individual fields may need to be broken down into multiple concepts to understand their meaning"]                                         
+                            },
+                            "deserializing-parsing-code": {
+                                "description": "Code for deserializing and parsing incoming data",
+                                "implementation-status": "not-started",
+                                "notes": ["Deserializing and parsing code can be used for transforming incoming data into a usable format",
+                                          "This would likely target strategic language/technology platforms: .NET, Java, Node.js"]
+                            },
+                            "shacl": {
+                                "description": "SHACL shapes for validating data against the target ontology",
+                                "implementation-status": "not-started",
+                                "notes": ["SHACL shapes are used to define constraints on the data",
+                                          "We cannot produce SHACL shapes directly, since individual fields may need to be broken down into multiple concepts to understand their meaning"]
+                            }
+                        }
+                    },
+                    "egress-support": {
+                        "description": "support for producing data from an underlying graph populated by the system",
+                        "implementation-status": "see individual artefacts",
+                        "artefacts": {
+                            "sparql-queries": {
+                                "description": "SPARQL queries for producing data from an RDF graph (or database)",
+                                "implementation-status": "in-progress",
+                                "notes": ["SPARQL queries are used to map data from the target ontology to the source format",
+                                         "SPARQL queries can only construct columnar data, therefore 'jolt-transformations' would need to supplement"]
+                            },
+                            "jolt-transformations": {
+                                "description": "Jolt transformations for transforming data into a specific format",
+                                "implementation-status": "not-started",
+                                "notes": ["Jolt transformations can be used to transform data from one format to another",
+                                          "These would be used to transform the data produced by SPARQL queries into the desired output format, based on mappings"]
+                            },
+                            "xslt-transformations": {
+                                "description": "XSLT transformations for transforming XML data into a specific format",
+                                "implementation-status": "not-started",
+                                "notes": ["XSLT transformations can be used to transform XML data from one format to another",
+                                          "These would be used to transform the data produced by SPARQL queries into the desired output format, based on mappings"]
+                            },
+                            "serializing-code": {
+                                "description": "Code for serializing data into a specific format",
+                                "implementation-status": "not-started",
+                                "notes": ["Serializing code can be used for transforming data into a specific format for egress",
+                                          "This would likely target strategic data formats: json, bson, xml"]
+                            }
+                        }
+                    },
+                    "cross-schema-transformation-support": {
+                        "note": "Since mappings describe the meaning of data, we can skip graph ingress/egress and just generate mappings to transform from A-to-B",
+                        "supplemental-note": "We may wish to generate configuration that drives mappings for other technology systems, e.g., Apache NiFi, Snaplogic, etc."
+                    }
+                }
+            },
+            "runtime-integrations": {
+                "description": "Deployment and management of generated artefacts to support live integrations and other scenarios",
+                "examples": {
+                    "github-repo": "Push generated code to github, possibly leveraging templates for standardizing artefacts",
+                    "http-listening-endpoint": "Expose a REST API endpoint for receiving data from a mapped external system",
+                    "kafka-listening-endpoint": "Expose a Kafka endpoint for receiving data from a mapped external system",
+                    "extractor-endpoint": "Expose an endpoint for extracting data from a mapped external system (e.g., from a DB using R2RML)",
+                    "http-outbound-endpoint": "Expose an endpoint for sending data to a mapped external system",
+                    "kafka-producer-endpoint": "Expose a Kafka producer endpoint for sending data to a mapped external system",
+                    "database-endpoint": "Expose a database endpoint for writing data to a mapped external datastore (e.g., SQL DB)"
+                }
+            }
+        }
+    },
+    "existing-assets": {
+        "mork": {
+            "description": "a vocabulary that extends skos to provide meaningful mapping axioms for interrelating concepts across schemes",
+            "notes": "provides a model for building 'mappings' that can be used to generate code and other assets for runtime integration use",
+            "url": "https://github.com/hyperthunk/mork",
+            "note": "public/open-source repo"
+        },
+        "MorkSharp": {
+            "description": "a .NET library and apps for working with Mork vocabularies",
+            "notes": "provides a set of tools for building and manipulating Mork ontologies, including a command line tool for generating code from Mork vocabularies",
+            "technology": ".NET/F#",
+            "url": "https://github.com/hyperthunk/MorkSharp",
+            "note": "private-repo",
+            "components": {
+                "morksharp": {
+                    "description": "a .NET library for working with Mork vocabularies, RDF graphs, etc",
+                    "status": "in-progress"
+                },
+                "nanu": {
+                    "description": "a library + console app that consumes and generates the artefacts listed below",
+                    "status": "in-progress",
+                    "artefacts": {
+                        "input-artefacts": {
+                            "json": { "description": "JSON sample data files", "implementation-status": "complete" },
+                            "json-schema": { "description": "JSON Schema files", "implementation-status": "in-progress" },
+                            "xml": { "description": "XML files", "implementation-status": "not-started" },
+                            "csv": { "description": "CSV files", "implementation-status": "not-started" }
+                        },
+                        "output-artefacts": {
+                            "mork-concept-scheme-ontology": {
+                                "description": "an ontology containing 2 concept schemes, derived from the input artefacts",
+                                "status": "complete",
+                                "usage": [
+                                    "feed ML/AI for the purposes of generating training data and mappings to a target ontology",
+                                    "track the paths where data are found, for generating config/code to consume the data"
+                                ],
+                                "content-model": {
+                                    "type": "OWL Ontology",
+                                    "concept-schemes": {
+                                        "taxonomy": "a set of mork concepts and hierarchical relationships derived from the input artefacts",
+                                        "representation": "a set of mork concepts that model the representation/rendering of the 'taxonomy' seen in the input artefacts"
+                                    }
+                                }
+                            },
+                            "owl-ontology": {
+                                "description": "an ontology that maps the representations of the concept-scheme ontology into a formal DL",
+                                "status": "not-started",
+                                "usage": [
+                                    "feed ML/AI for the purposes of generating training data and mappings to a target ontology",
+                                    "provide a semantic knowledge base to articulate the meaning of the taxonomy from which it was generated"
+                                ],
+                                "content-model": {
+                                    "type": "OWL Ontology",
+                                    "concept-schemes": {
+                                        "taxonomy": "a set of mork concepts and hierarchical relationships derived from the input artefacts",
+                                        "representation": "a set of mork concepts that model the representation/rendering of the 'taxonomy' seen in the input artefacts"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                "mindy": {
+                    "description": "a library for generating artefacts from mork mapping ontologies",
+                    "example-outputs": ["code", "configuration data", "documentation", "tests", "RML mapping graphs", 
+                                        "Db Queries (e.g., SPARQL)", "GraphQL schemas", "etc"]
+                }
+            }
+        },
+        "rml-pipeline": {
+            "description": "a non-blocking, streaming, massively parallel pipeline implementation for transforming and mapping data using RML",
+            "note": "there are many excellent RML tools available - this is an area of active research",
+            "technology": ".NET/F#",
+            "status": "in-progress",
+            "usage": [
+                "transform data from various sources into a unified format",
+                "map data to the Mork ontology"
+            ]
+        }
+    },
+    "requirements": {
+        "knowledge-graphs": {
+            "description": "we can build knowledge graphs from schemas, taxonomies, and other structured data sources (including sample data)",
+            "existing-assets": "the MorkSharp project provides an app for building mork ontologies from sample data (to be extended to other inputs)"
+        },
+        "processing-data": {
+            "semantic-contracts": {
+                "description": "we can process data using semantic contracts that describe the meaning of the data",
+                "overview": "external systems need to conform to our model, only onboard their data using our platform and send it in native format to our generated consuming endpoints"
+            },
+            "annotated-data": {
+                "description": "mork mappings can be used to produce a json-ld context that can be associated with a payload in order to 'annotate' the data with its ontological meaning(s)",
+                "overview": "data is annotated with semantic metadata that describes the meaning of the data, allowing us to process it in a meaningful way, without the provider needing to change their physical schemas/contracts"
+            },
+            "generative-integrations": {
+                "description": "we can generate artefacts that can be used to automate consuming and transforming data"
+            },
+            "data-augmentation": {
+                "description": "we can use generative techniques to augment existing data with new information"
+            },
+            "data-integration": {
+                "description": "we can integrate data to and from multiple sources",
+                "overview": "due to the rich mapping data we capture and the semantic nature of our contracts, we can act as a transparent intermediary between data sources and sinks"
+            },
+            "domain-gateways": {
+                "description": "we can create domain-specific gateways that encapsulate the logic for interacting with external systems",
+                "overview": "with a semantic contract backed by a knowledge graph, we can provide a flexible, transactional master-data view that can be queried via GraphQL"
+            }
+        }
+    },
+    "constraints": {
+        "cost": "maintain reasonable costs and deliver via incremental agile approach",
+        "technologies": {
+            "approved-tech": [".NET", "Node.js", "python", "MongoDB", "OpenAI API", "Vector DBs", "Azure", "AWS"],
+            "by-exception-tech": ["java"],
+            "machine-learning-non-llm": {
+                "notes": "can be a blend of python and .NET",
+                "semantic-kernel": "already being prototyped for MorkSharp.Agent",
+                "lang-chain": "used in the business already",
+                "ML.NET": "good fit for our F# code, lightweight and simple to train and operate",
+                "Infer.NET": "good fit for our F# code, lightweight and simple to build and operate"
+            },
+            "front-end-preferences": {
+                "react": "approved and popular in our environment",
+                "giraffe": "good option as MorkShark is written in F#",
+                "fable": "write F#, compile to js and allows node.js dependencies - good option for lightweight tools"
+            },
+            "back-end-preference": {
+                "aspnet-core": "approved and high performance",
+                "factors": ["high performance", "reliability", "fault-tolerance", "cloud friendly"]
+            },
+            "undecided-tech": {
+                "rdf-graph-database": "TBC: would be good to support multiple",
+                "lpg-graph-database": "TBC: would be good to support multiple"
+            }
+        }
+    },
+    "poc-work-to-date": {
+        "aws-bedrock": {
+            "overview": "Attempted to process sample json data and produce meaningful mappings or generate RDF directly into Neptune",
+            "status": "Complete",
+            "outcomes": {
+                "rdf-ingest": "LLM unable to process whole json payload without exhausting tokens or getting bored",
+                "rml-generation": "abandoned once we realised that RML cannot dynamically produce mappings as it processes data",
+                "mapping-generation": "early success generating RDF data describing semantic similarity between json payload and an ontology",
+                "successes": {
+                    "graph-ingest": "Able to produce an accurate RDF payload (matching our ontology) from a prompt and a small blob of json data"
+                },
+                "learnings": {
+                    "input-size": "LLM struggles with larger payloads, requiring chunking or summarization, which is difficult with structured data",
+                    "rml-limitations": "RML's inability to dynamically produce mappings during processing limits its usefulness until we've discovered the right mappings",
+                    "mapping-complexity": "Mapping generation is non-trivial and requires a deep understanding of both the source data and the target ontology",
+                    "neptune-limitations": "Unlike Neo4J - which is likely too expensive - Neptune doesn't support algorithms, so we cannot do for example levenshtein distance calculations inside the DB"
+                },
+                "subsequent-actions": {
+                    "mork-ontology-development": "The success of producing mapping recommendations was impressive, so we invested in developing a vocabulary to allow the LLM to be more specific (and to share more of its thoughts about potential semantic matches) with a structured format"
+                }
+            }
+        }
+    }
+}
