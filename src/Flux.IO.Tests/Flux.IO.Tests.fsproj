@@ -9,6 +9,7 @@
     <Compile Include="Generators.fs" />
     <Compile Include="CoreMachine.fs" />
     <Compile Include="CoreTests.fs" />
+    <Compile Include="IntegrationModel.fs" />
     <!-- <Compile Include="CoreStreamProcessing.fs" /> -->
     <Compile Include="Main.fs" />
   </ItemGroup>

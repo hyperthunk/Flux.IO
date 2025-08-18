@@ -163,7 +163,7 @@ module CoreMachine =
                         }))
         }
 
-// Model for StreamProcessor behavior
+    // Model for StreamProcessor behavior
     module StreamProcessorModel =
         
         type ProcessorState<'TIn, 'TOut> = {

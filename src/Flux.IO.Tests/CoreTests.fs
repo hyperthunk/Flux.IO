@@ -176,7 +176,7 @@ module CoreTests =
     let envelopeTests =
         testList "Envelope" [
             testPropertyWithConfig 
-                    stdConfig 
+                    stdConfig
                     "mapEnvelope preserves metadata" <| fun (env: Envelope<int>) ->
 
                 let f x = x + 1
