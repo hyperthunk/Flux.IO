@@ -144,8 +144,8 @@ module Generators =
     // Simple function generator for int -> int using linear forms
     let genIntToIntF =
         gen {
-            let! a = Gen.choose(-5,5)
-            let! b = Gen.choose(-100,100)
+            let! a = Gen.choose(-5, 5)
+            let! b = Gen.choose(-100, 100)
             return fun (x:int) -> a * x + b
         }
 
@@ -166,7 +166,7 @@ module Generators =
                     Flow (fun _ ct ->
                         ValueTask<int>(
                         task {
-                            do! Task.Delay(delayMs, ct)
+                            do! Task.Delay(delayMs * 100, ct)
                             return v
                         }))
         }

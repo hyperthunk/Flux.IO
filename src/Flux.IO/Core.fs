@@ -54,7 +54,8 @@
     - Topology (what the DSL describes) - the shape of the pipeline with splits/joins
     - Runtime Orchestration (what we need to add) - manages channels, lifecycle, and execution
 
-    The architecture document's PipelineGraph with StageNode and Edge is the right abstraction for topology. What we need is a Runtime that can interpret this graph and:
+    The architecture document's PipelineGraph with StageNode and Edge is the right 
+    abstraction for topology. What we need is a Runtime that can interpret this graph and:
 
     Create channels/queues between stages based on Edge descriptors
     Manage stage lifecycle (on-demand vs persistent vs continuous)
@@ -168,7 +169,9 @@ module Core =
             Flow (fun _ _ -> ValueTask<unit>(()))
             
         (* TODO: test monadic bind *)
-        let bind (f: 'a -> Flow<'b>) (Flow m: Flow<'a>) : Flow<'b> =
+        let bind 
+                (f: 'a -> Flow<'b>) 
+                (Flow m: Flow<'a>) : Flow<'b> =
             Flow (fun env ct ->
                 let va = m env ct
                 if va.IsCompletedSuccessfully then

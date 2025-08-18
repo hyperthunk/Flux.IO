@@ -1,6 +1,7 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net9.0</TargetFramework>
+    <OutputType>Exe</OutputType>
     <AssemblyName>Flux.IO.Tests</AssemblyName>
     <GenerateProgramFile>false</GenerateProgramFile>
   </PropertyGroup>
@@ -8,6 +9,7 @@
     <Compile Include="Generators.fs" />
     <Compile Include="CoreMachine.fs" />
     <Compile Include="CoreTests.fs" />
+    <!-- <Compile Include="CoreStreamProcessing.fs" /> -->
     <Compile Include="Main.fs" />
   </ItemGroup>
   <ItemGroup>

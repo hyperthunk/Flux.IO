@@ -286,16 +286,16 @@ module CoreMachine =
         let filterProcessorSpec() =
             let setup pred =
                 { new Setup<ProcessorSut<int, int>, ProcessorState<int, int>>() with
-                    member _.Actual() = ProcessorSut(StreamProcessor.filter pred)
-                    member _.Model() = emptyState }
+                    member __.Actual() = ProcessorSut(StreamProcessor.filter pred)
+                    member __.Model() = emptyState }
                     
             { new Machine<ProcessorSut<int, int>, ProcessorState<int, int>>() with
-                member _.Setup = 
+                member __.Setup = 
                     Arb.generate<int -> bool>
                     |> Gen.map setup 
                     |> Arb.fromGen
                     
-                member _.Next _model =
+                member __.Next _ =
                     gen {
                         let! env = genIntEnvelope
                         return ProcessEnvelopeOp(env) :> Operation<_, _>
