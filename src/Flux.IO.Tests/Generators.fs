@@ -7,6 +7,8 @@ open FSharp.HashCollections
 open Newtonsoft.Json
 open System
 open System.Collections.Concurrent
+open System.Collections.Generic
+open System.Data
 open System.Threading    
 open System.Threading.Tasks
 
@@ -184,30 +186,6 @@ module Generators =
             return (int, func)
         }
 
-    let genJson = 
-        gen {
-            let! avgWidth = Gen.sized <| fun s -> Gen.choose(2, s)
-            let! avgDepth = Gen.sized <| fun s -> Gen.choose(1, s)
-            // let jsonRoot = JsonConvert.SerializeObject
-            let! json = 
-                let rec json' size =
-                    
-                    (* if size > 0 then
-                        Gen.constant "{}"
-                    else
-                        let! key = Gen.stringOf (Gen.elements ['a'..'z'])
-                        let! value = Gen.oneof [
-                            Gen.constant "null"
-                            Gen.constant "true"
-                            Gen.constant "false"
-                            Gen.stringOf (Gen.elements ['a'..'z'])
-                            json' (size - 1)
-                        ]
-                        return sprintf "\"%s\":%s" key value *)
-                in Gen.sized json'
-            return (avgWidth, avgDepth)
-        }
-
     // Produces the correct arbitrary (generated) test data on demand
     type CoreTestArbitraries =
         static member TestInt() = Arb.generate<int>
@@ -240,6 +218,241 @@ module Generators =
                 member __.Generator = genFunOverInt
                 member __.Shrinker _ = Seq.empty
             }
+
+    module JsonGenerators =
+        open Newtonsoft.Json.Linq
+
+        // Generate random property names
+        let genPropertyName =
+            gen {
+                let! length = Gen.choose(3, 12)
+                let! chars = Gen.arrayOfLength length (Gen.elements (['a'..'z'] @ ['A'..'Z']))
+                let! suffix = Gen.elements [""; "_id"; "_name"; "_value"; "_type"; "_count"; "_date"]
+                return String(chars) + suffix
+            }
+
+        // Generate scalar JSON values
+        let genScalarValue =
+            Gen.oneof [
+                Gen.constant (JValue.CreateNull() :> JToken)  // null
+                Arb.generate<bool> |> Gen.map (fun b -> JValue(b) :> JToken)  // boolean
+                Arb.generate<int> |> Gen.map (fun i -> JValue(i) :> JToken)  // integer
+                Arb.generate<float> |> Gen.map (fun f -> JValue(f) :> JToken)  // float
+
+                Gen.elements [""; "test"; "value"; "data"; "example"; "foo"; "bar"] 
+                |> Gen.map (fun s -> JValue(s) :> JToken)  // common strings
+                
+                Arb.generate<string> 
+                |> Gen.filter (fun s -> s <> null) 
+                |> Gen.map (fun s -> JValue(s) :> JToken)  // random strings
+                
+                Arb.generate<DateTime> 
+                |> Gen.map (fun dt -> JValue(dt.ToString("O")) :> JToken)  // ISO date strings
+            ]
+
+        // Generate JSON arrays
+        let rec genJsonArray depth size =
+            gen {
+                if depth <= 0 || size <= 0 then
+                    // At leaf level, only scalar values
+                    let! length = Gen.choose(0, min 5 size)
+                    let! elements = Gen.listOfLength length genScalarValue
+                    return JArray(elements) :> JToken
+                else
+                    // Can have nested structures
+                    let! length = Gen.choose(0, min 4 size)
+                    let elementSize = max 1 (size / (length + 1))
+                    let! elements = Gen.listOfLength length (genJsonValue (depth - 1) elementSize)
+                    return JArray(elements) :> JToken
+            }
+
+        // Generate JSON objects
+        and genJsonObject depth size =
+            gen {
+                if depth <= 0 || size <= 0 then
+                    // Leaf object with only scalar values
+                    let! numProps = Gen.choose(1, min 5 (max 1 size))
+                    let! props = Gen.listOfLength numProps (
+                        gen {
+                            let! name = genPropertyName
+                            let! value = genScalarValue
+                            return (name, value)
+                        }
+                    )
+                    
+                    let obj = JObject()
+                    for (name, value) in props do
+                        obj.[name] <- value
+                    return obj :> JToken
+                else
+                    // Can have nested objects and arrays
+                    let! numScalarProps = Gen.choose(0, min 3 size)
+                    let! numNestedProps = Gen.choose(1, min 3 (max 1 (size - numScalarProps)))
+                    
+                    let! scalarProps = Gen.listOfLength numScalarProps (
+                        gen {
+                            let! name = genPropertyName
+                            let! value = genScalarValue
+                            return (name, value)
+                        }
+                    )
+                    
+                    let nestedPropSize = max 1 (size / (numNestedProps + 1))
+                    let! nestedProps = Gen.listOfLength numNestedProps (
+                        gen {
+                            let! name = genPropertyName
+                            let! value = genJsonValue (depth - 1) nestedPropSize
+                            return (name, value)
+                        }
+                    )
+                    
+                    let obj = JObject()
+                    for (name, value) in scalarProps @ nestedProps do
+                        obj.[name] <- value
+                    return obj :> JToken
+            }
+
+        // Generate any JSON value
+        and genJsonValue depth size =
+            if depth <= 0 || size <= 0 then
+                genScalarValue
+            else
+                Gen.frequency [
+                    (3, genScalarValue)  // Higher weight for scalars
+                    (2, genJsonObject depth size)
+                    (1, genJsonArray depth size)
+                ]
+
+        // Main JSON generator with size support for shrinking
+        let genJson =
+            Gen.sized (fun size ->
+                gen {
+                    // Scale depth based on size (smaller size = shallower depth)
+                    let maxDepth = min 5 (max 1 (size / 10))
+                    let! depth = Gen.choose(0, maxDepth)
+                    let! json = genJsonObject depth size
+                    return json.ToString Formatting.Indented
+                }
+            )
+
+        // Alternative: Generate JSON with specific structure requirements
+        let genJsonWithStructure minProps maxProps maxDepth =
+            Gen.sized (fun size ->
+                gen {
+                    let rec buildObject depth currentSize =
+                        gen {
+                            let adjustedMax = min maxProps (max minProps currentSize)
+                            let! numProps = Gen.choose(minProps, adjustedMax)
+                            let propSize = max 1 (currentSize / (numProps + 1))
+                            
+                            let! props = Gen.listOfLength numProps (
+                                gen {
+                                    let! name = genPropertyName
+                                    let! valueType = Gen.choose(0, 10)
+                                    let! value =
+                                        match valueType with
+                                        | n when n < 5 -> genScalarValue  // 50% scalar
+                                        | n when n < 8 && depth > 0 -> buildObject (depth - 1) propSize  // 30% nested object
+                                        | _ when depth > 0 -> genJsonArray (depth - 1) propSize  // 20% array
+                                        | _ -> genScalarValue  // Fallback to scalar at depth 0
+                                    return (name, value)
+                                }
+                            )
+                            
+                            let obj = JObject()
+                            for (name, value) in props do
+                                obj.[name] <- value
+                            return obj :> JToken
+                        }
+                        
+                    let! depth = Gen.choose(0, min maxDepth (size / 5))
+                    let! root = buildObject depth size
+                    return root.ToString(Formatting.Indented)
+                }
+            )
+
+        // Generate JSON that matches common patterns
+        let genTypicalJson =
+            Gen.oneof [
+                // User-like object
+                gen {
+                    let! id = Gen.choose(1, 10000)
+                    let! name = Gen.elements ["Alice", "Bob", "Charlie", "David", "Eve"]
+                    let! email = Gen.map2 (sprintf "%s@%s.com") 
+                                    (Gen.elements ["user"; "admin"; "test"]) 
+                                    (Gen.elements ["example"; "test"; "mail"])
+                    let! age = Gen.choose(18, 80)
+                    let! active = Arb.generate<bool>
+                    
+                    let obj = JObject()
+                    obj.["id"] <- JValue(id)
+                    obj.["name"] <- JValue(name)
+                    obj.["email"] <- JValue(email)
+                    obj.["age"] <- JValue(age)
+                    obj.["active"] <- JValue(active)
+                    obj.["created"] <- JValue(DateTime.UtcNow.ToString("O"))
+                    
+                    return obj.ToString()
+                }
+                
+                // Nested configuration object
+                gen {
+                    let! env = Gen.elements ["dev", "test", "prod"]
+                    let! port = Gen.choose(1000, 9999)
+                    let! debug = Arb.generate<bool>
+                    
+                    let config = JObject()
+                    config.["environment"] <- JValue(env)
+                    config.["server"] <- JObject([
+                        JProperty("port", port)
+                        JProperty("host", "localhost")
+                    ])
+                    config.["features"] <- JObject([
+                        JProperty("debug", debug)
+                        JProperty("logging", true)
+                    ])
+                    
+                    return config.ToString()
+                }
+                
+                // Array of items
+                gen {
+                    let! count = Gen.choose(1, 5)
+                    let! items = Gen.listOfLength count (
+                        gen {
+                            let! id = Gen.choose(1, 100)
+                            let! value = Gen.elements ["A", "B", "C", "D"]
+                            let! quantity = Gen.choose(1, 10)
+                            
+                            let item = JObject()
+                            item.["id"] <- JValue(id)
+                            item.["value"] <- JValue(value)
+                            item.["quantity"] <- JValue(quantity)
+                            return item
+                        }
+                    )
+                    
+                    let root = JObject()
+                    root.["items"] <- JArray(items)
+                    root.["total"] <- JValue(items.Length)
+                    
+                    return root.ToString()
+                }
+            ]
+
+        // Test the generators
+        let examples() =
+            printfn "Basic JSON:"
+            let basic = Gen.sample 10 1 genJson
+            basic |> List.iter (printfn "%s\n")
+            
+            printfn "\nStructured JSON (2-4 props, max depth 3):"
+            let structured = Gen.sample 10 1 (genJsonWithStructure 2 4 3)
+            structured |> List.iter (printfn "%s\n")
+            
+            printfn "\nTypical JSON:"
+            let typical = Gen.sample 10 3 genTypicalJson
+            typical |> List.iter (printfn "%s\n")
 
 module TestEnv =
 

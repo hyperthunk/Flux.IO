@@ -167,6 +167,7 @@ module Core =
         let inline zero () : Flow<unit> = 
             Flow (fun _ _ -> ValueTask<unit>(()))
             
+        (* TODO: test monadic bind *)
         let bind (f: 'a -> Flow<'b>) (Flow m: Flow<'a>) : Flow<'b> =
             Flow (fun env ct ->
                 let va = m env ct
