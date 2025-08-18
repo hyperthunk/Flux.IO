@@ -14,3 +14,4 @@ nuget Expecto 10.2.3
 nuget Expecto.FsCheck 10.2.3
 nuget Microsoft.NET.Test.Sdk
 nuget YoloDev.Expecto.TestSdk 0.15.3
+nuget Newtonsoft.Json

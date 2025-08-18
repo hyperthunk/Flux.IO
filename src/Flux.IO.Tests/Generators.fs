@@ -1,12 +1,14 @@
 namespace Flux.IO.Tests
 
+open Flux.IO
+open Flux.IO.Core
+open FsCheck
+open FSharp.HashCollections
+open Newtonsoft.Json
 open System
 open System.Collections.Concurrent
 open System.Threading    
 open System.Threading.Tasks
-open Flux.IO.Core
-open FsCheck
-open FSharp.HashCollections
 
 module Generators = 
 
@@ -180,6 +182,30 @@ module Generators =
             let! int = Arb.generate<int>
             let! func = genIntToIntF
             return (int, func)
+        }
+
+    let genJson = 
+        gen {
+            let! avgWidth = Gen.sized <| fun s -> Gen.choose(2, s)
+            let! avgDepth = Gen.sized <| fun s -> Gen.choose(1, s)
+            // let jsonRoot = JsonConvert.SerializeObject
+            let! json = 
+                let rec json' size =
+                    
+                    (* if size > 0 then
+                        Gen.constant "{}"
+                    else
+                        let! key = Gen.stringOf (Gen.elements ['a'..'z'])
+                        let! value = Gen.oneof [
+                            Gen.constant "null"
+                            Gen.constant "true"
+                            Gen.constant "false"
+                            Gen.stringOf (Gen.elements ['a'..'z'])
+                            json' (size - 1)
+                        ]
+                        return sprintf "\"%s\":%s" key value *)
+                in Gen.sized json'
+            return (avgWidth, avgDepth)
         }
 
     // Produces the correct arbitrary (generated) test data on demand
