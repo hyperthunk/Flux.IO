@@ -95,7 +95,7 @@ module Core =
         Attrs   : HashMap<string,obj>
         Cost    : Cost
     } with 
-        static member create<'T> seqId payload =
+        static member create<'T> seqId (payload: 'T) =
             { 
                 Payload = payload
                 Headers = HashMap.empty
@@ -167,7 +167,6 @@ module Core =
         let inline zero () : Flow<unit> = 
             Flow (fun _ _ -> ValueTask<unit>(()))
             
-        // Bind with proper type annotations to avoid inference issues
         let bind (f: 'a -> Flow<'b>) (Flow m: Flow<'a>) : Flow<'b> =
             Flow (fun env ct ->
                 let va = m env ct
@@ -181,7 +180,7 @@ module Core =
                         let (Flow g) = f a
                         return! g env ct
                     }
-                    ValueTask<'b>(task)
+                    ValueTask<'b> task
             )
             
         // Computation expression builder
@@ -215,12 +214,12 @@ module Core =
         let liftTask (t: Task<'a>) : Flow<'a> =
             Flow (fun _ ct ->
                 if t.IsCompletedSuccessfully then 
-                    ValueTask<'a>(t.Result)
+                    ValueTask<'a> t.Result
                 else 
-                    ValueTask<'a>(task {
+                    task {
                         let! result = t
                         return result
-                    })
+                    } |> ValueTask<'a>
             )
             
         let liftValueTask (vt: ValueTask<'a>) : Flow<'a> =
@@ -234,7 +233,7 @@ module Core =
             
         // Environment access
         let ask : Flow<ExecutionEnv> =
-            Flow (fun env _ -> ValueTask<ExecutionEnv>(env))
+            Flow (fun env _ -> ValueTask<ExecutionEnv> env)
             
         let asks (f: ExecutionEnv -> 'a) : Flow<'a> =
             Flow (fun env _ -> ValueTask<'a>(f env))
@@ -259,10 +258,10 @@ module Core =
                         let! result = run env cts.Token m
                         return Some result
                     with
-                    | :? System.OperationCanceledException when ct.IsCancellationRequested |> not ->
+                    | :? OperationCanceledException when ct.IsCancellationRequested |> not ->
                         return None
                 }
-                ValueTask<'a option>(task)
+                ValueTask<'a option> task
             )
             
         // Error handling
@@ -275,7 +274,7 @@ module Core =
                     with ex ->
                         return Error ex
                 }
-                ValueTask<Result<'a, exn>>(task)
+                ValueTask<Result<'a, exn>> task
             )
             
         let tryFinally (m: Flow<'a>) (finalizer: unit -> unit) : Flow<'a> =
@@ -286,7 +285,7 @@ module Core =
                     finally
                         finalizer()
                 }
-                ValueTask<'a>(task)
+                ValueTask<'a> task
             )
 
     // Stream processing monad that builds on Flow
@@ -296,7 +295,7 @@ module Core =
     and StreamCommand<'T> =
         | Emit of Envelope<'T>
         | EmitMany of Envelope<'T> list
-        | RequireMore
+        | Consume
         | Complete
         | Error of exn
         
@@ -327,7 +326,9 @@ module Core =
             )
             
         // Monadic bind for stream processors
-        let bind (f: 'b -> StreamProcessor<'b, 'c>) (StreamProcessor p: StreamProcessor<'a, 'b>) : StreamProcessor<'a, 'c> =
+        let bind 
+                (f: 'b -> StreamProcessor<'b, 'c>) 
+                (StreamProcessor p: StreamProcessor<'a, 'b>) : StreamProcessor<'a, 'c> =
             StreamProcessor (fun env ->
                 flow {
                     let! cmd = p env
@@ -347,14 +348,16 @@ module Core =
                             | EmitMany es -> results.AddRange(es)
                             | _ -> ()
                         return EmitMany (results |> List.ofSeq)
-                    | RequireMore -> return RequireMore
+                    | Consume -> return Consume
                     | Complete -> return Complete
                     | Error e -> return Error e
                 }
             )
             
         // Kleisli composition
-        let compose (f: 'b -> StreamProcessor<'b, 'c>) (g: 'a -> StreamProcessor<'a, 'b>) : 'a -> StreamProcessor<'a, 'c> =
+        let compose 
+                (f: 'b -> StreamProcessor<'b, 'c>) 
+                (g: 'a -> StreamProcessor<'a, 'b>) : 'a -> StreamProcessor<'a, 'c> =
             fun a -> bind f (g a)
             
         // Filter processor
@@ -364,12 +367,14 @@ module Core =
                     if predicate env.Payload then
                         return Emit env
                     else
-                        return RequireMore
+                        return Consume
                 }
             )
             
         // Stateful processor
-        let stateful (initial: 'state) (f: 'state -> 'a -> ('state * 'b option)) : StreamProcessor<'a, 'b> =
+        let stateful 
+                (initial: 'state) 
+                (f: 'state -> 'a -> ('state * 'b option)) : StreamProcessor<'a, 'b> =
             let state = ref initial
             StreamProcessor (fun env ->
                 flow {
@@ -378,7 +383,7 @@ module Core =
                     match result with
                     | Some value -> 
                         return Emit (mapEnvelope (fun _ -> value) env)
-                    | None -> return RequireMore
+                    | None -> return Consume
                 }
             )
             
