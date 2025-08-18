@@ -373,10 +373,10 @@ module CoreMachine =
                     |> Gen.map setup 
                     |> Arb.fromGen
                     
-                member _.Next(_model) =
+                member _.Next(_) =
                     gen {
                         let! env = genIntEnvelope
-                        return ProcessEnvelopeOp(env) :> Operation<_, _>
+                        return ProcessEnvelopeOp env :> Operation<_, _>
                     }
             }
             
@@ -423,7 +423,7 @@ module CoreMachine =
                     member _.Model() = emptyState }
             { new Machine<ProcessorSut<int, string>, ProcessorState<int, string>>() with
                 member _.Setup = Gen.constant (setup()) |> Arb.fromGen
-                member _.Next(_model) =
+                member _.Next(_) =
                     gen {
                         let! value = Gen.choose(-10, 20)
                         let! seqId = Gen.choose(1, 1000) |> Gen.map int64
