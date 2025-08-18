@@ -65,8 +65,8 @@ module CoreTests =
                 Prop.forAll 
                     (CoreTestArbitraries.FlowAndFunctions())
                     (fun (m,g,h) ->
-                        let lhs = Flow.map (g >> h) m
-                        let rhs = Flow.map h (Flow.map g m)
+                        let lhs = Flow.map (g << h) m
+                        let rhs = Flow.map g (Flow.map h m)
                         flowEq lhs rhs
                     )
 
@@ -190,7 +190,7 @@ module CoreTests =
                 Expect.isEmpty (Set.difference s1 s2) "Expected equal attribute keys"
 
                 // whilst we *could* check reference equality, HashMap makes no guarantees 
-                // object the order of value elements when calling `toSeq`
+                // about the order of value elements when calling `toSeq`
                 let l1 = HashMap.values mapped.Attrs |> List.ofSeq
                 let l2 = HashMap.values env.Attrs |> List.ofSeq
                 Expect.equal l1.Length l2.Length "Expected equal attribute value counts"
@@ -262,8 +262,8 @@ module CoreTests =
                         Attrs = HashMap.empty
                         Cost = { Bytes = 0; CpuHint = 0.0 }
                     }
-                    
-                let inputs = [1;2;3;4;5;6;7]
+
+                let inputs = [1; 2; 3; 4; 5; 6; 7]
                 let outputs =
                     inputs
                     |> List.map (fun i -> 
@@ -336,9 +336,8 @@ module CoreTests =
 
         let N = 3
 
-        // System under test: using stateful StreamProcessor identical to code in testCase earlier
         let mkProcessor () =
-            StreamProcessor.stateful (0,0) (fun (sum,count) x ->
+            StreamProcessor.stateful (0,0) (fun (sum, count) x ->
                 let sum' = sum + x
                 let count' = count + 1
                 if count' = N then 
@@ -394,7 +393,7 @@ module CoreTests =
                     |> fun vt -> vt.Result
                 
                 match res with
-                | StreamCommand.Emit e -> sutOutputs <- e.Payload :: sutOutputs
+                | Emit e -> sutOutputs <- e.Payload :: sutOutputs
                 | _ -> ()
                 
                 // step model
@@ -419,15 +418,18 @@ module CoreTests =
                 let! cmds = Gen.listOf genCmd
                 let specInstance = spec()
                 return (cmds, specInstance)
-            }
-            |> Arb.fromGen
+            }               // Gen<Cmd list * Sut>
+            |> Arb.fromGen  // Arbitrary<Cmd list * Sut>
             |> (flip Prop.forAll)
                 (fun (cmds, specInstance: Sut) -> specInstance.Run cmds)
 
     [<Tests>]
     let modelBasedTests =
         testList "Model-Based (Stateful Sum Machine)" [
-            testPropertyWithConfig fastConfig "stateful sum model invariants hold" StatefulSumModel.propMachine
+            testPropertyWithConfig 
+                fastConfig 
+                "stateful sum model invariants hold" 
+                StatefulSumModel.propMachine
         ]
 
     [<Tests>]
