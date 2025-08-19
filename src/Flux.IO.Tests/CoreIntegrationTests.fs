@@ -641,7 +641,7 @@ module CoreIntegrationTestSuite =
 
     [<Tests>]
     let coreIntegrationTests =
-        ftestList "IntegrationTestProperties" [
+        testList "IntegrationTestProperties" [
             testPropertyWithConfig Config.std "Script invariants hold" prop_scriptInvariants
             testPropertyWithConfig Config.std "Source uniqueness & reparse structural equality" prop_sourceUniqueness
             testPropertyWithConfig Config.std "Accumulation union monotonic" prop_accumMonotonic

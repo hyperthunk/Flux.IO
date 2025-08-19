@@ -5,6 +5,7 @@ module TestRunner =
     open Expecto
     open Flux.IO.Tests
     open Flux.IO.Tests.CoreTests
+    open Flux.IO.Tests.FramingTests
     open Flux.IO.Tests.CoreIntegrationTestSuite
     // open Flux.IO.Tests.CoreStreamProcessingTests
 
@@ -13,6 +14,7 @@ module TestRunner =
 
         let allTests = testList "Flux.IO" [
             // jsonPipelineTests
+            framingProperties
             coreIntegrationTests
             coreTests
             CoreMachine.streamProcessorModelTests

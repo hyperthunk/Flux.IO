@@ -9,6 +9,8 @@
     <Compile Include="Generators.fs" />
     <Compile Include="CoreMachine.fs" />
     <Compile Include="CoreTests.fs" />
+    <Compile Include="JsonStreamProcessors.fs" />
+    <Compile Include="FramingTests.fs" />
     <Compile Include="IntegrationStages.fs" />
     <Compile Include="CoreIntegrationPipeline.fs" />
     <Compile Include="CoreIntegrationMachine.fs" />

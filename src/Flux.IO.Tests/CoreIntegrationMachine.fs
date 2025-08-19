@@ -317,7 +317,16 @@ module CoreIntegrationMachine =
         loop len 0
 
     let startChunkDoc model seed useAccum threshold useProj chunkSize =
-        let pipe = PipelineBuilder.chunked (seed, (if useAccum then threshold else None), useProj, true, (fun rem -> min chunkSize rem))
+        // Use LengthGate for now; can parameterize later
+        let pipe =
+            PipelineBuilder.chunked (
+                seed,
+                (if useAccum then threshold else None),
+                useProj,
+                true,
+                (fun rem -> min chunkSize rem),
+                ParseMode.LengthGate
+            )
         let rng = Random seed
         let sample =
             FsCheck.Gen.eval 10 (FsCheck.Random.StdGen (rng.Next(), rng.Next())) Generators.JsonGenerators.genJson
@@ -325,7 +334,13 @@ module CoreIntegrationMachine =
         let bytes = Encoding.UTF8.GetBytes sample
         let cls = classifyRoot tok
         let docId = model.NextId
-        let totalChunks = computeChunkCount bytes.Length chunkSize
+        let totalChunks =
+            let rec loop remaining count =
+                if remaining <= 0 then count
+                else
+                    let sz = min chunkSize remaining |> max 1
+                    loop (remaining - sz) (count + 1)
+            loop bytes.Length 0
         let chunkData =
             { TotalBytes = bytes.Length
               Consumed = 0
