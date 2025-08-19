@@ -628,7 +628,6 @@ module CoreIntegrationProperties =
 // Expecto Test List
 // ----------------------------------------------------------------------
 
-[<AutoOpen>]
 module CoreIntegrationTestSuite =
 
     open CoreIntegrationProperties

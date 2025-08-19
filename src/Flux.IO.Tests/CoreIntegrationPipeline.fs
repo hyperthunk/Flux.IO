@@ -88,7 +88,9 @@ module CoreIntegrationPipeline =
                 | ParseMode.Frame ->
                     let asm = FramingAssembler() :> IJsonAssembler<JToken>
                     AssemblerProcessor.create asm
-                | ParseMode.StreamMaterialize
+                | ParseMode.StreamMaterialize ->
+                    let asm = JsonStreaming.StreamingMaterializeAssembler() :> IJsonAssembler<JToken>
+                    AssemblerProcessor.create asm
                 | ParseMode.StreamTokens ->
                     failwith "Streaming modes not implemented in Phase 1+2."
 
