@@ -1,131 +1,141 @@
-4. Modify Primary Pipeline DU to Include PStream
-Edit existing CoreIntegrationPipeline.fs (show diff region only). Add a new case and builder reference.
+Tier‑B establishes structural guarantees and abstraction surfaces that Tier‑C assumes. If we short‑cut certain Tier‑B items, Tier‑C becomes either more complex or requires rework.
 
+Below is a structured dependency map.
 
-CoreIntegrationPipeline.fs
-v8
-// ... existing content above ...
+Core Abstraction & Interface Dependencies
+Tier‑B Provides:
 
-    type Pipeline =
-        | PDirect of DirectPipeline
-        | PChunk  of ChunkPipeline
-        | PStream of CoreIntegrationStreamingPipeline.StreamingPipeline   // NEW
+IJsonAssembler<JToken> abstraction (already in place).
+ParseMode discriminated union and pipeline builder switch.
+Structural framing (FramingAssembler) that removes reliance on expectedLength.
+Internal streaming scanner (StreamingMaterializeAssembler) proving incremental scan feasibility.
+Tier‑C Requires:
 
-// (No changes to existing builders; PStream builder lives in CoreIntegrationStreamingPipeline.Builder)
+A stable boundary for swapping the “materializing” assembler with a token event reader (TokenStreamReader).
+Confidence that chunk pipelines no longer depend on prior length knowledge (framer must be validated & optionally default).
+Error and completion semantics (root termination detection) consistent across all assemblers.
+Dependency: If the ParseMode switch and assembler interface are not frozen, adding PStream (token pipeline) risks churn. Finalize the assembler interface now (e.g. whether a future finalize/end-of-input signal will be introduced) before emitting external token streams.
 
-5. Model & Machine Extensions
-Add new runtime state record for streaming docs (token counts, completion).
+Structural Framing vs External Token Streaming
+What Tier‑B Guarantees:
 
-CoreIntegrationMachine.Streaming.fs
+FramingAssembler correctly identifies root completion without length.
+Depth tracking logic proven via tests (instrumented assembler).
+Needed by Tier‑C:
 
-Rather than rewriting the whole Sut, we recommend a second dictionary (pipelinesStream) to keep existing logic stable.
+Token reader uses the same root completion semantics (same definition of “root terminal” to avoid divergence).
+Depth and string escape rules verified (so token depth invariants in Tier‑C aren’t rediscovering bugs).
+Dependency: If framing invariants (depth convergence, balanced containers, no early completion) are not fully locked, Tier‑C token depth invariants will generate duplicate failures or false positives. Complete and harden framing tests—including deep nesting and edge string cases—before broadening to token pipelines.
 
-Additions (patch style):
+Completion & Finalization Semantics
+Current Situation:
 
-```
-// Inside type Sut() add:
-    let streamPipelines = System.Collections.Concurrent.ConcurrentDictionary<int, CoreIntegrationMachineStreaming.ExtendedRuntimePipeline>()
+StreamingMaterializeAssembler scans incrementally but never receives a “final block” signal (isFinalBlock always false).
+Corruption tests tolerate “pending” (neither complete nor error) for incomplete/truncated documents.
+Tier‑C Needs:
 
-    member _.RegisterStream (id:int) (pipe: CoreIntegrationStreamingPipeline.StreamingPipeline) =
-        let rt = { CoreIntegrationMachineStreaming.StreamingRuntime.SourceEmitted=false
-                   ToBytesRun=false; TokensSeen=0; RootCompleted=false
-                   AccumDone=false; ProjectionScalars=false; ProjectionObjects=false }
-        streamPipelines.TryAdd(id, CoreIntegrationMachineStreaming.RStream(pipe, rt)) |> ignore
+A deterministic end-of-input signal to:
+Emit a definitive error for truncated documents.
+Allow token pipelines to raise final invariants (e.g. root must have closed by finalize).
+Prevent indefinite Consume loops in live streaming scenarios.
+Dependency: Introduce a finalize/end-of-input stage or a FeedEnd()/Flush() semantic (or add a zero-length feed with a flag) before exposing token streaming externally. Otherwise tests for malformed/truncated token streams will be fuzzy or permissive.
 
-    member this.StepStream id =
-        match streamPipelines.TryGetValue id with
-        | true, CoreIntegrationMachineStreaming.RStream(pl, rt) ->
-            // One feed step across the streaming chain
-            // Source -> ToBytes -> Chunker -> TokenReader (+ domain stages)
-            // For now only advance Source once (like direct)
-            if not rt.SourceEmitted then
-                // run source
-                ()
-            else
-                ()
-        | _ -> ()
-```
+Instrumentation & Invariants
+Tier‑B Instrumentation:
 
-(Command & operation integration omitted for brevity; you would add a new Command variant StartStreamChunk + StepStreamToken etc.)
+Depth trace, start/end object/array counts, primitive root detection.
+Tier‑C Reuse:
 
-Given the size of this response, I’m keeping machine integration scaffolding minimal—let me know if you want the full command & operation wiring now or in a subsequent incremental PR once you settle on the exact streaming semantics.
+Token-level invariants: depth never negative, exactly one root terminal, container open/close parity.
+Streaming accumulation must rely on correct detection of root-level property/value pairing (depends on reliable token ordering from reader).
+Dependency: Stabilize instrumentation data structures now (names, counters) so Tier‑C can lift them directly into runtime state or test harness without renaming churn.
 
+Accumulation / Projection Semantics
+Current (Tier‑B):
 
-6. New Invariants (Token Mode)
-Add a test file verifying:
+Accumulation & projection operate over final JToken.
+Assumptions: single emission JToken; root object keys discoverable in one pass.
+Tier‑C Goal:
 
-Depth monotonic non-negative (already via instrumentation earlier)
-RootTerminal appears exactly once
-Accum streaming Done implies union ⊆ final scalar keys (if materializer present later)
+Incrementally surface partial domain: root-level scalar keys (and optionally nested structures) before full materialization.
+Dependencies:
 
-```
-namespace Flux.IO.Tests
+Define canonical ordering for streaming accumulation (e.g. property name then its value token).
+Decide monotonic exposure rule (emit each scalar once vs batching).
+Align “done” condition (root closed OR all scalar names encountered earlier).
+If not specified now, initial Tier‑C accumulation might mismatch expectations set by existing batch-based accumulation (e.g. thresholds vs single-key emission) and require translation glue or parallel modes.
 
-open System
-open FsCheck
-open Expecto
-open TokenStreaming
-open JsonStreamProcessors.JsonAssembler
-open StreamingDomainStages
-open Newtonsoft.Json.Linq
+Benchmark / Performance Baseline
+Optional Tier‑B Step:
 
-module StreamingTokenProperties =
+Running a baseline benchmark (LengthGate vs Frame vs StreamingMaterialize) BEFORE building PStream.
+Dependency Nature: Not strictly blocking, but without a baseline you cannot attribute overhead introduced in Tier‑C to token emission vs pre-existing streaming scan costs. Capturing memory + throughput now avoids false regressions later.
 
-    // Placeholder property skeletons to be filled once machine wiring is done.
-    [<Tests>]
-    let tokenStreamingProps =
-        testList "Token Streaming (Phase 5 Scaffold)" [
-            test "placeholder" {
-                // This keeps build green until full integration.
-                Expect.isTrue true "placeholder"
-            }
-        ]
-```
+Default ParseMode Decision
+Current:
 
-7. Next Steps Checklist
-Action sequence to fully realize Phase 5:
+LengthGate is still the conservative default.
+Tier‑C Impact:
 
-Integrate PStream DU (done in code).
-Finish streaming pipeline builder (remove failwith, return PStream).
-Add machine support:
-New Command variants: StartStream, StepStream (source/toBytes/chunker feed), StepToken (token reader), StepAccumToken, StepProjectionToken.
-Enable Next() to schedule these operations similarly to chunk docs.
-Extend invariants:
-Token depth never negative (reuse instrumentation or track via runtime).
-RootTerminal => subsequent steps produce no new tokens.
-Accum batches disjoint, union subset of discovered scalar names (mirrors existing accumulation invariants).
-Add equivalence property: materializing streaming tokens (or re-parsing origin JSON) deep-equals original.
-Optional: performance micro-benchmark for PStream vs StreamMaterialize.
+If downstream test harnesses or external consumers migrate to streaming, they will expect length-independence everywhere.
+Leaving LengthGate default invites silent assumptions (e.g. tests that still rely on expectedLength logic).
+Dependency: Switching default to Frame before Tier‑C reduces risk that token streaming mode “works on my machine” but fails for long-tail cases where length preview had masked framing issues.
 
-8. Rationale for Minimal Materializer (Current Stub)
-Right now materializer returns a placeholder. This keeps scope small; once token streaming semantics are correct, you can:
+Error Surface Policy
+Tier‑B:
 
-Replace stub with a true reconstruction (maintain a JTokenWriter inside a TokenMaterializer stage processing TokenEvent list).
-Or short-circuit by reusing the original JSON text (needs capturing outside reader).
-If you want a full token-based reconstruction now, ask and I can supply a JTokenWriter-based TokenMaterializer stage.
+Corruption tests currently allow a “pending” state rather than requiring an error without a final signal.
+Tier‑C:
 
-9. Recommended Incremental Merge Strategy
-PR 1 (Phase 5-A):
+Token clients must distinguish: (a) well‑formed JSON ended; (b) more bytes required; (c) irrecoverable malformed input.
+Dependency: Define a tri-state explicitly (NeedMore | Complete | Error) + finalize semantics so external streaming clients can implement backpressure and termination. Without finalize, token accumulators might wait forever on truncated feeds.
 
-Add TokenEvent, TokenStreamReader, PStream DU, streaming builder (without machine integration).
-Add placeholder tests (green build).
-PR 2 (Phase 5-B):
+Testing Infrastructure Dependency
+Machine Extensions:
 
-Machine command & runtime integration for PStream (no accumulation/projection yet).
-Depth / root completion invariants.
-PR 3 (Phase 5-C):
+Adding PStream requires either:
+Extending DocumentRuntime with a StreamingDoc variant, OR
+Parallel dictionary (as hinted) → unify later.
+Dependency: Finalize how commands like StepToken, StepStreamAccum integrate with existing scheduling before implementing streaming invariants. If the machine refactor is postponed until after ad‑hoc token properties, you risk duplicating invariant logic.
 
-Streaming accumulation & projection (stages + invariants + parity tests).
-Token materializer (real implementation).
-Remove placeholder tests.
-This keeps each review focused and reduces risk.
+Recommendation: Introduce a thin StreamingRuntime record + new Command union cases before implementing streaming accumulation, so invariants integrate once.
 
-Let me know:
+Summary Dependency Matrix
+Tier‑B Item	Tier‑C Impact	Priority Before Tier‑C
+Stable IJsonAssembler interface	Direct plug-in for TokenReader	MUST
+Framing correctness + parity tests	Token depth & root boundary reliability	MUST
+Finalize / end‑of‑input signal design	Deterministic malformed handling	HIGH
+Instrumentation schema (depth counters, root flags)	Reused invariants & debugging	HIGH
+Default ParseMode switch (Frame)	Length independence assumption	HIGH (optional but recommended)
+Benchmark baseline	Performance regression attribution	MEDIUM
+Streaming accumulation semantics spec	Avoid rework of domain events	HIGH
+Materializer approach decision (token → JToken)	Parity & regression tests	MEDIUM
+Corruption strictness policy	Negative test determinism	MEDIUM (depends on finalize)
+Machine PStream command integration design	Unified model invariants	MUST (design)
+Recommended Sequence Now
 
-Do you want the full machine wiring now (bigger diff)?
-Should the materializer be fully implemented in Phase 5-A?
-Do you prefer accumulation to emit Domain coverage incrementally (monotonic) from the start?
-I can follow up with whichever subset you want next. Just specify and I’ll produce the next patch set.
+Decide finalize semantics (e.g. new method Finalize() on assembler or a sentinel Feed call with a flag).
 
-Would you like me to proceed with the full machine command wiring immediately?
+Switch default to Frame (run all invariants again).
 
+Lock instrumentation structure & naming.
+
+Write a one‑page “Streaming Accumulation Spec” (event ordering, threshold adaptation, domain completeness rule).
+
+Capture performance baseline (optional but valuable).
+
+Implement PStream DU + minimal token reader integration (no accumulation yet) + machine support & depth invariants.
+
+Add streaming accumulation & projection stages using agreed spec.
+
+Add real token-based materializer (JTokenWriter) and parity property (DeepEquals).
+
+Tighten corruption property (pending state disallowed after finalize).
+
+Layer performance regression property or benchmark CI gate if needed.
+
+When You Can Safely Start Tier‑C You can start once:
+Framing tests are stable and green across fuzz partitions.
+StreamingMaterializeAssembler (or its replacement) exposes or is paired with a finalization path.
+A clear streaming accumulation spec is written (even if not fully implemented).
+Starting earlier is possible but increases rework probability (particularly around finalize and accumulation semantics).
