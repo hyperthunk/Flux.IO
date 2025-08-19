@@ -1,4 +1,4 @@
-namespace Flux.IO.Tests.Integration
+namespace Flux.IO.Tests
 
 open System
 open System.Text
@@ -228,7 +228,7 @@ module IntegrationModel =
                                 |> HashMap.toSeq
                                 |> Seq.map (fun (k,v) -> k, string v)
                                 |> dict
-                                |> fun d -> JObject(d |> Seq.map (fun kvp -> JProperty(kvp.Key, JValue(kvp.Value)))))
+                                |> fun d -> JObject(d |> Seq.map (fun kvp -> JProperty(kvp.Key, JValue(kvp.Value))))
                             // Reset working to allow further accumulation (we treat disjoint sets ideally)
                             working.Value <- HashMap.empty
                             return Emit { mapEnvelope (fun _ -> snapshot.ToString(Formatting.None)) env with Payload = snapshot.ToString(Formatting.None) }

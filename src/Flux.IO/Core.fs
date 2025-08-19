@@ -193,10 +193,14 @@ module Core =
             member _.ReturnFrom(m: Flow<_>) = m
             member _.Zero() = zero()
             member _.Bind(m, f) = bind f m
-            member _.Delay(f) = f()
+            member __.Delay f = f()
 
-            member this.Try(f) = failwith "Not Implemented"
-            
+            member __.TryWith(r,fn) =
+                try 
+                    r()
+                with
+                | ex -> fn ex
+
             member _.Combine(m1: Flow<unit>, m2: Flow<'a>) = 
                 bind (fun () -> m2) m1
             member _.For(sequence: seq<'T>, body: 'T -> Flow<unit>) : Flow<unit> =
