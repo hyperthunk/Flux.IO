@@ -146,100 +146,104 @@ module JsonStreamProcessors =
         open System.Text.Json
         open JsonAssembler
         open System.Buffers
+        open System.Text
 
+        /// Streaming assembler that scans incrementally to detect root completion
+        /// using Utf8JsonReader, but only materializes the final JToken by parsing
+        /// the accumulated full UTF-8 buffer once root completion has been detected.
+        ///
+        /// Advantages:
+        ///   - Early error detection while scanning tokens
+        ///   - Guarantees identical final JToken to a single full parse
+        ///   - Avoids JTokenWriter incremental edge cases
+        ///
+        /// Semantics:
+        ///   - StatusNeedMore until root structure (or primitive) fully observed
+        ///   - StatusComplete with parsed JToken once root completes
+        ///   - Subsequent Feed calls after completion yield StatusComplete (idempotent)
         type StreamingMaterializeAssembler(?maxBytes:int) =
             let maxBytes = defaultArg maxBytes (64 * 1024 * 1024)
             let buffer = ArrayBufferWriter<byte>()
             let mutable processed = 0
-            let mutable state = JsonReaderState()
-            let writer = new JTokenWriter()
+            let mutable readerState = JsonReaderState()
             let mutable rootCompleted = false
-            let mutable rootTokenEmitted = false
-            let mutable sawRootToken = false  // set after first root token (primitive or start container)
+            let mutable emitted = false
+            let mutable cachedToken : JToken option = None
 
-            let writeToken (r: byref<Utf8JsonReader>) =
-                match r.TokenType with
-                | JsonTokenType.StartObject -> sawRootToken <- true; writer.WriteStartObject()
-                | JsonTokenType.EndObject   -> writer.WriteEndObject()
-                | JsonTokenType.StartArray  -> sawRootToken <- true; writer.WriteStartArray()
-                | JsonTokenType.EndArray    -> writer.WriteEndArray()
-                | JsonTokenType.PropertyName -> writer.WritePropertyName(r.GetString())
-                | JsonTokenType.String -> 
-                    if not sawRootToken then sawRootToken <- true
-                    writer.WriteValue(r.GetString())
-                | JsonTokenType.Number ->
-                    if not sawRootToken then sawRootToken <- true
-                    let mutable l = 0L
-                    if r.TryGetInt64(&l) then writer.WriteValue(l)
-                    else
-                        let mutable d = 0.0
-                        if r.TryGetDouble(&d) then writer.WriteValue(d)
-                        else writer.WriteValue(r.GetDecimal())
-                | JsonTokenType.True  -> if not sawRootToken then sawRootToken <- true; writer.WriteValue(true)
-                | JsonTokenType.False -> if not sawRootToken then sawRootToken <- true; writer.WriteValue(false)
-                | JsonTokenType.Null  -> if not sawRootToken then sawRootToken <- true; writer.WriteNull()
-                | JsonTokenType.Comment
-                | JsonTokenType.None -> ()
-                | _ -> ()
-                ()
+            let isRootTerminal (r: inref<Utf8JsonReader>) =
+                if r.TokenType = JsonTokenType.EndObject || r.TokenType = JsonTokenType.EndArray then
+                    r.CurrentDepth = 0
+                elif (r.TokenType = JsonTokenType.String
+                      || r.TokenType = JsonTokenType.Number
+                      || r.TokenType = JsonTokenType.True
+                      || r.TokenType = JsonTokenType.False
+                      || r.TokenType = JsonTokenType.Null) && r.CurrentDepth = 0 then
+                    true
+                else
+                    false
+
+            let tryScanRootCompletion () =
+                if rootCompleted then () else
+                // Slice new unread portion
+                let slice = buffer.WrittenSpan.Slice(processed)
+                if slice.Length = 0 then ()
+                else
+                    let mutable r = new Utf8JsonReader(slice, isFinalBlock=false, state=readerState)
+                    try
+                        let mutable doneLocal = false
+                        while not doneLocal && r.Read() do
+                            if isRootTerminal &r then
+                                rootCompleted <- true
+                                doneLocal <- true
+                        processed <- processed + int r.BytesConsumed
+                        readerState <- r.CurrentState
+                    with ex ->
+                        // On read error, surface immediately by raising status error through Feed
+                        raise ex
+
+            let finalizeParse () =
+                if emitted then cachedToken.Value
+                else
+                    let json = Encoding.UTF8.GetString(buffer.WrittenSpan)
+                    let tok = JToken.Parse json
+                    cachedToken <- Some tok
+                    emitted <- true
+                    tok
 
             interface IJsonAssembler<JToken> with
                 member _.Feed (chunk: ReadOnlyMemory<byte>) =
-                    if rootTokenEmitted then
-                        StatusComplete writer.Token
+                    if emitted then
+                        JsonAssembler.StatusComplete (cachedToken.Value)
                     else
+                        // Capacity guard
                         if buffer.WrittenCount + chunk.Length > maxBytes then
-                            StatusError (InvalidOperationException(sprintf "Streaming size limit exceeded (%d bytes)" maxBytes))
+                            JsonAssembler.StatusError (
+                                InvalidOperationException(
+                                    sprintf "Streaming size limit exceeded (%d bytes)" maxBytes))
                         else
-                            if not chunk.IsEmpty then buffer.Write(chunk.Span)
+                            // Append incoming bytes
+                            if not chunk.IsEmpty then
+                                buffer.Write(chunk.Span)
+                            // Attempt to scan for root completion
+                            let status =
+                                try
+                                    tryScanRootCompletion()
+                                    if rootCompleted then
+                                        try
+                                            let tok = finalizeParse()
+                                            JsonAssembler.StatusComplete tok
+                                        with exParse ->
+                                            JsonAssembler.StatusError exParse
+                                    else
+                                        JsonAssembler.StatusNeedMore
+                                with exScan ->
+                                    JsonAssembler.StatusError exScan
+                            status
 
-                            // Slice of new data
-                            let spanAll = buffer.WrittenSpan
-                            let newSlice = spanAll.Slice(processed)
-                            let mutable reader = new Utf8JsonReader(newSlice, isFinalBlock = false, state=state)
-                            try
-                                while reader.Read() do
-                                    writeToken &reader
-                                    // Detect root completion:
-                                    if (reader.TokenType = JsonTokenType.EndObject || reader.TokenType = JsonTokenType.EndArray) && reader.CurrentDepth = 0 then
-                                        rootCompleted <- true
-                                    elif (reader.TokenType = JsonTokenType.String
-                                           || reader.TokenType = JsonTokenType.Number
-                                           || reader.TokenType = JsonTokenType.True
-                                           || reader.TokenType = JsonTokenType.False
-                                           || reader.TokenType = JsonTokenType.Null)
-                                         && reader.CurrentDepth = 0
-                                         && not rootCompleted
-                                         && sawRootToken
-                                         then
-                                        // Primitive top-level root completed immediately
-                                        rootCompleted <- true
-
-                                processed <- processed + int reader.BytesConsumed
-                                state <- reader.CurrentState
-
-                                if rootCompleted && not rootTokenEmitted then
-                                    // Finalize and ensure writer.Token is materialized
-                                    writer.Close()
-                                    match writer.Token with
-                                    | null ->
-                                        // Token not yet available; wait for more data (unlikely except partial multi-byte boundary)
-                                        StatusNeedMore
-                                    | tok ->
-                                        rootTokenEmitted <- true
-                                        StatusComplete tok
-                                else
-                                    StatusNeedMore
-                            with ex ->
-                                StatusError ex
-
-                member _.Completed = rootTokenEmitted
+                member _.Completed = emitted
 
     module JsonStreamingInstrumentation =
-        open System
-        open System.Buffers
         open System.Text.Json
-        open Newtonsoft.Json.Linq
         open JsonAssembler
 
         type StreamingInstrumentation =

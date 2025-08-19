@@ -201,6 +201,16 @@ module Core =
                 with
                 | ex -> fn ex
 
+            member __.While(condition: unit -> bool, body: unit -> Flow<unit>) =
+                Flow (fun env ct ->
+                    let rec loop () =
+                        if condition() then
+                            run env ct (body())
+                        else
+                            ValueTask<unit>(())
+                    loop ()
+                )
+
             member _.Combine(m1: Flow<unit>, m2: Flow<'a>) = 
                 bind (fun () -> m2) m1
             member _.For(sequence: seq<'T>, body: 'T -> Flow<unit>) : Flow<unit> =

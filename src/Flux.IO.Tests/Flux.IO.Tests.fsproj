@@ -11,6 +11,9 @@
     <Compile Include="CoreTests.fs" />
     <Compile Include="CoreJsonStreamProcessors.fs" />
     <Compile Include="FramingTests.fs" />
+    <Compile Include="JsonTokenStreaming.fs" />
+    <Compile Include="CoreStreamingErrorTests.fs" />
+    <Compile Include="CoreStreamingInvariantsTests.fs" />
     <Compile Include="CoreStreamingMaterializeTests.fs" />
     <Compile Include="IntegrationStages.fs" />
     <Compile Include="CoreIntegrationPipeline.fs" />

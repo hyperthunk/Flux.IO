@@ -9,8 +9,7 @@ open Expecto
 open JsonStreamProcessors.JsonAssembler
 open JsonStreamProcessors.JsonStreamingInstrumentation
 
-module StreamingInvariantsTests =
-
+module CoreStreamingInvariantsTests =
     let genJsonText =
         Generators.JsonGenerators.genJson
         |> Arb.fromGen
