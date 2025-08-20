@@ -1,0 +1,12 @@
+FSharp.HashCollections
+FsToolkit.ErrorHandling
+FSharpPlus
+FSharp.Control.TaskSeq
+FSharp.Control.AsyncSeq
+
+group Test
+    Expecto
+    Expecto.FsCheck
+    Microsoft.NET.Test.Sdk
+    YoloDev.Expecto.TestSdk
+    Newtonsoft.Json

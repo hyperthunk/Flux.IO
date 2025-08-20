@@ -1,0 +1,33 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>Flux.IO.Tests</AssemblyName>
+    <GenerateProgramFile>false</GenerateProgramFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Generators.fs" />
+    <Compile Include="CoreMachine.fs" />
+    <Compile Include="CoreTests.fs" />
+    <Compile Include="CoreJsonStreamProcessors.fs" />
+    <Compile Include="FramingTests.fs" />
+    <Compile Include="JsonTokenStreaming.fs" />
+    <Compile Include="CoreStreamingErrorTests.fs" />
+    <Compile Include="CoreStreamingInvariantsTests.fs" />
+    <Compile Include="CoreStreamingMaterializeTests.fs" />
+    <Compile Include="IntegrationStages.fs" />
+    <Compile Include="CoreIntegrationPipeline.fs" />
+    <Compile Include="CoreIntegrationMachine.fs" />
+    <Compile Include="CoreIntegrationTests.fs" />
+    <!-- <Compile Include="CoreStreamProcessing.fs" /> -->
+    <Compile Include="Main.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Flux.IO\Flux.IO.fsproj" />
+    <PackageReference Include="coverlet.collector" Version="6.0.4">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+  <Import Project="..\..\.paket\Paket.Restore.targets" />
+</Project>
