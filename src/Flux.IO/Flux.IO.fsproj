@@ -7,6 +7,7 @@
   <ItemGroup>
     <Compile Include="Collections.fs" />
     <Compile Include="Core.fs" />
+    <Compile Include="Flow.fs" />
   </ItemGroup>
   <Import Project="..\..\.paket\Paket.Restore.targets" />
 </Project>
