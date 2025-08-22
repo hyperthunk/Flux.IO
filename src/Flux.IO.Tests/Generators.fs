@@ -1,7 +1,7 @@
 namespace Flux.IO.Tests
 
 open Flux.IO
-open Flux.IO.Core
+open Flux.IO.Core1
 open FsCheck
 open FSharp.HashCollections
 open Newtonsoft.Json

@@ -7,8 +7,8 @@ module CoreTests =
     open System.Threading.Tasks
     open Expecto
     open Flux.IO.Collections
-    open Flux.IO.Core
-    open Flux.IO.Core.Flow
+    open Flux.IO.Core1
+    open Flux.IO.Core1.Flow
     open FsCheck
     open FSharpPlus
     open FSharp.HashCollections

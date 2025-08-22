@@ -70,8 +70,8 @@ module CoreMachine =
     open System.Threading
     open System.Threading.Tasks
     open Expecto
-    open Flux.IO.Core
-    open Flux.IO.Core.Flow
+    open Flux.IO.Core1
+    open Flux.IO.Core1.Flow
     open FsCheck
     open FsCheck.Experimental
     open FSharp.HashCollections

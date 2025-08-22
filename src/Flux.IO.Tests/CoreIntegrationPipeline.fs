@@ -5,8 +5,8 @@ open System.Text
 open Newtonsoft.Json.Linq
 open FSharp.HashCollections
 open Flux.IO
-open Flux.IO.Core
-open Flux.IO.Core.Flow
+open Flux.IO.Core1
+open Flux.IO.Core1.Flow
 open Generators.JsonGenerators
 
 open IntegrationStages

@@ -64,7 +64,7 @@
     Monitor and adapt based on performance metrics
 *)
 
-module Core =
+module Core1 =
 
     open FSharp.Control
     open FSharp.HashCollections

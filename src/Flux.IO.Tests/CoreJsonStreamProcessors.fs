@@ -7,8 +7,8 @@ module JsonStreamProcessors =
     open System.Buffers
     open Newtonsoft.Json.Linq
     open Flux.IO
-    open Flux.IO.Core
-    open Flux.IO.Core.Flow
+    open Flux.IO.Core1
+    open Flux.IO.Core1.Flow
 
     module JsonAssembler =
 
