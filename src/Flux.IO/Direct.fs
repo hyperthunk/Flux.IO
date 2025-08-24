@@ -43,34 +43,36 @@ module Direct =
         //  * Non-blocking integration with scheduler / registration
         //  * Timeout / cancellation bridging
         //  * Backpressure gating before start
-        let handle = spec.Build env
-        if not handle.IsStarted then
-            let _ = handle.Start() // Acquire AsyncHandle<'T>; we rely on handle.IsCompleted transitioning
-            ()
-        let rec spin () =
-            if ct.IsCancellationRequested then
-                ValueTask<'T>(Task.FromCanceled<'T>(ct))
-            else
-                if handle.IsCompleted then
-                    // We assume the backend ensures completed handle contains final result accessible via an AsyncHandle poll.
-                    // Need a way to retrieve the stored result. If design requires, ExternalHandle<'T> can expose TryGetResult.
-                    // For now, we reinterpret the Start result contract: Start returns AsyncHandle<'T> we can invoke immediately.
-                    let ah = handle.Start()  // Idempotent or supply property
-                    match ah.Await() with
-                    | AsyncDone (ValueSome v)    -> ValueTask<'T> v
-                    | AsyncDone ValueNone        -> ValueTask<'T>(Task.FromException<'T>(InvalidOperationException "External completed with no value"))
-                    | AsyncFailed (ValueSome ex) -> ValueTask<'T>(Task.FromException<'T> ex)
-                    | AsyncFailed ValueNone      -> ValueTask<'T>(Task.FromException<'T>(Exception "Unknown external failure"))
-                    | AsyncCancelled _           -> ValueTask<'T>(Task.FromCanceled<'T> ct)
-                    | AsyncPending               ->
-                        // Unexpected: completed but token says pending
-                        Async.Sleep 0 |> Async.RunSynchronously |> ignore
-                        spin() // TODO: this could block forever if there is a fault in the async result code - fix!
-                else
-                    // simple yielding strategy (replace with better scheduling)
-                    Async.Sleep 10 |> Async.RunSynchronously |> ignore
-                    spin()
-        spin()
+        task {
+            let handle = spec.Build env
+            
+            if not handle.IsStarted then
+                let _ = handle.Start()
+                ()
+            
+            let asyncHandle = handle.Start()
+            
+            // Register cancellation
+            use _ = ct.Register(fun () -> asyncHandle.Cancel())
+            
+            // Simply wait for the result
+            let result = asyncHandle.Await()
+            
+            match result with
+            | AsyncDone (ValueSome v) -> 
+                return v
+            | AsyncDone ValueNone -> 
+                return raise (InvalidOperationException "External completed with no value")
+            | AsyncFailed (ValueSome ex) -> 
+                return raise ex
+            | AsyncFailed ValueNone -> 
+                return raise (Exception "Unknown external failure")
+            | AsyncCancelled _ -> 
+                return raise (OperationCanceledException())
+            | AsyncPending ->
+                // Should not happen after Await()
+                return raise (InvalidOperationException "Await returned Pending")
+        } |> ValueTask<'T>
 
     let rec private execute 
             (env: ExecutionEnv) 
@@ -261,119 +263,496 @@ module Direct =
     module Lift =
 
         /// Lift a Task<'T> by eagerly wrapping as ExternalSpec (simple adapter).
-        let task (factory: unit -> Task<'T>) : Flow<'T> =
-            // Wrap: Start will run the task; poll via a simple handle adapter
-            let tcell = new TaskCompletionSource<'T>(factory())
+        let task(factory: unit -> Task<'T>) : Flow<'T> =
             let spec =
                 { 
-                    Build = (fun _ ->
+                    Build = fun _ ->
+                        let mutable task = Unchecked.defaultof<Task<'T>>
+                        let started = new ManualResetEventSlim(false)
+                        
                         { new ExternalHandle<'T> with
-                            member __.Id = tcell.Task.Id.GetHashCode()
-                            member __.Class = 
-                                let name = tcell.Task.GetType().FullName
-                                in EffectExternal name
-                            member __.IsStarted = 
-                                tcell.Task.Status = TaskStatus.Running ||
-                                tcell.Task.Status = TaskStatus.RanToCompletion
-                            member __.IsCompleted = tcell.Task.IsCompleted
-                            member __.Start () =
-                                async {
-                                    factory().ContinueWith(fun (rt: Task<'T>) ->
-                                        if rt.IsCanceled then
-                                            tcell.TrySetCanceled() |> ignore
-                                        elif rt.IsFaulted then
-                                            tcell.TrySetException rt.Exception.InnerExceptions |> ignore
-                                        else
-                                            tcell.TrySetResult rt.Result |> ignore
-                                    ) |> ignore
-                                } |> Async.StartAsTask |> ignore
-                                let token = AsyncToken tcell.Task
+                            member _.Id = 123 // factory.GetHashCode()
+                            member _.Class = EffectExternal "System.Threading.Tasks.Task"
+                            member _.IsStarted = started.IsSet
+                            member _.IsCompleted = 
+                                started.IsSet && not (isNull task) && task.IsCompleted
+                            
+                            member _.Start() =
+                                if not started.IsSet then
+                                    task <- factory()
+                                    started.Set()
+                                
+                                let token = AsyncToken task
                                 { new AsyncHandle<'T>(token) with
-                                    member __.IsCompleted = tcell.Task.IsCompleted
-                                    member __.Await() =
-                                        if tcell.Task.IsCompletedSuccessfully then 
-                                            AsyncDone (ValueSome tcell.Task.Result)
-                                        elif tcell.Task.IsFaulted then 
-                                            AsyncFailed (ValueSome tcell.Task.Exception.InnerException)
-                                        elif tcell.Task.IsCanceled then 
+                                    member _.IsCompleted = task.IsCompleted
+                                    
+                                    member _.Poll() =
+                                        if task.IsCompletedSuccessfully then 
+                                            AsyncDone (ValueSome task.Result)
+                                        elif task.IsFaulted then 
+                                            AsyncFailed (ValueSome task.Exception.InnerException)
+                                        elif task.IsCanceled then 
                                             AsyncCancelled ValueNone
                                         else AsyncPending
+                                    
+                                    member this.Await() =
+                                        task.Wait()
+                                        this.Poll()
+                                    
                                     member this.AwaitTimeout ts = 
-                                        // Simple blocking wait with timeout
-                                        if tcell.Task.Wait ts then this.Await()
-                                        else AsyncPending
-                                    member _.Cancel() = 
-                                        // we cannot cancel an arbitrary external task here
-                                        ()
+                                        if task.Wait(ts) then 
+                                            this.Poll()
+                                        else 
+                                            AsyncPending
+                                    
+                                    member _.Cancel() = ()
                                     member this.CancelWait() = this.Await()
                                     member this.CancelWaitTimeout ts = this.AwaitTimeout ts
                                 }
-                            override __.Dispose() = tcell.Task.Dispose()
+                            
+                            member _.Dispose() = 
+                                started.Dispose()
+                                if not (isNull task) then task.Dispose()
                         }
-                    )
-                    Classify = typeof<Task<'T>>.FullName |> EffectExternal
+                    Classify = EffectExternal "Task"
                     DebugLabel = Some "lift-task" 
                 }
             externalSpec spec
 
         /// Lift Async<'T>
         let async (comp: Async<'T>) : Flow<'T> =
-            let tcell = new TaskCompletionSource<'T>()
-            let ctoken = new CancellationToken()
-            let ctokenSrc = CancellationTokenSource.CreateLinkedTokenSource ctoken
+            let spec = { 
+                Build = fun _ ->
+                    let cts = new CancellationTokenSource()
+                    let started = new ManualResetEventSlim(false)
+                    let mutable task = Unchecked.defaultof<Task<'T>>
+                    
+                    { new ExternalHandle<'T> with
+                        member _.Id = 123 // FIXME
+                        member _.Class = EffectExternal "FSharp.Control.Async"
+                        member _.IsStarted = started.IsSet
+                        member _.IsCompleted = 
+                            started.IsSet && not (isNull task) && task.IsCompleted
+                        
+                        member _.Start() =
+                            if not started.IsSet then
+                                task <- Async.StartAsTask(comp, cancellationToken = cts.Token)
+                                started.Set()
+                            
+                            // Return handle to the RUNNING task
+                            { new AsyncHandle<'T>(AsyncToken task) with
+                                member _.IsCompleted = task.IsCompleted
+                                
+                                member _.Poll() =
+                                    if task.IsCompletedSuccessfully then
+                                        AsyncDone (ValueSome task.Result)
+                                    elif task.IsFaulted then
+                                        AsyncFailed (ValueSome task.Exception.InnerException)
+                                    elif task.IsCanceled then
+                                        AsyncCancelled ValueNone
+                                    else
+                                        AsyncPending
+                                
+                                member this.Await() =
+                                    task.Wait()
+                                    this.Poll()
+                                
+                                member this.AwaitTimeout ts =
+                                    if task.Wait ts then this.Poll()
+                                    else AsyncPending
+                                
+                                member _.Cancel() = cts.Cancel()
+                                
+                                member this.CancelWait() = 
+                                    cts.Cancel()
+                                    this.Await()
+                                
+                                member this.CancelWaitTimeout ts = 
+                                    cts.Cancel()
+                                    this.AwaitTimeout ts
+                            }
+                        
+                        member _.Dispose() = 
+                            started.Dispose()
+                            cts.Dispose()
+                            if not (isNull task) then task.Dispose()
+                    }
+                Classify = EffectExternal "Async"
+                DebugLabel = Some "lift-async" 
+            }
+            externalSpec spec
+
+    module MBox =
+            
+        type private AsyncMessage<'T> =
+            | Start of AsyncReplyChannel<unit>
+            | Poll of AsyncReplyChannel<AsyncResult<'T>>
+            | Wait of AsyncReplyChannel<AsyncResult<'T>>
+            | WaitTimeout of TimeSpan * AsyncReplyChannel<AsyncResult<'T>>
+            | Cancel
+        
+        let lift (comp: Async<'T>) : Flow<'T> =
             let spec =
                 { 
-                    Build = (fun _ ->
+                    Build = fun _ ->
+                        let started = new ManualResetEventSlim(false)
+                        let completed = new ManualResetEventSlim(false)
+                        let mutable result = AsyncPending
+                        let cts = new CancellationTokenSource()
+                        
+                        let agent = MailboxProcessor<AsyncMessage<'T>>.Start(fun inbox ->
+                            let rec notStarted() = async {
+                                let! msg = inbox.Receive()
+                                match msg with
+                                | Start reply ->
+                                    // Start the computation
+                                    Async.StartWithContinuations(
+                                        comp,
+                                        (fun value -> 
+                                            result <- AsyncDone (ValueSome value)
+                                            completed.Set()
+                                        ),
+                                        (fun ex -> 
+                                            result <- AsyncFailed (ValueSome ex)
+                                            completed.Set()
+                                        ),
+                                        (fun _ -> 
+                                            result <- AsyncCancelled ValueNone
+                                            completed.Set()
+                                        ),
+                                        cts.Token
+                                    )
+                                    started.Set()
+                                    reply.Reply()
+                                    return! running()
+                                | Poll reply ->
+                                    reply.Reply AsyncPending
+                                    return! notStarted()
+                                | Wait reply ->
+                                    reply.Reply AsyncPending
+                                    return! notStarted()
+                                | WaitTimeout (_, reply) ->
+                                    reply.Reply AsyncPending
+                                    return! notStarted()
+                                | Cancel ->
+                                    return! notStarted()
+                            }
+                            
+                            and running() = async {
+                                let! msg = inbox.Receive()
+                                match msg with
+                                | Start reply ->
+                                    reply.Reply() // Already started
+                                    return! running()
+                                | Poll reply ->
+                                    reply.Reply (if completed.IsSet then result else AsyncPending)
+                                    return! running()
+                                | Wait reply ->
+                                    // Spawn async to wait
+                                    async {
+                                        completed.Wait()
+                                        reply.Reply result
+                                    } |> Async.Start
+                                    return! running()
+                                | WaitTimeout (ts, reply) ->
+                                    // Spawn async to wait with timeout
+                                    async {
+                                        if completed.Wait(ts) then
+                                            reply.Reply result
+                                        else
+                                            reply.Reply AsyncPending
+                                    } |> Async.Start
+                                    return! running()
+                                | Cancel ->
+                                    cts.Cancel()
+                                    return! running()
+                            }
+                            
+                            notStarted()
+                        )
+                        
+                        let createHandle() : AsyncHandle<'T> =
+                            { new AsyncHandle<'T>(AsyncToken agent) with
+                                member _.IsCompleted = completed.IsSet
+                                member _.Poll() = agent.PostAndReply Poll
+                                member _.Await() = agent.PostAndReply Wait
+                                member _.AwaitTimeout ts = 
+                                    agent.PostAndReply(fun ch -> WaitTimeout(ts, ch))
+                                member _.Cancel() = agent.Post Cancel
+                                member this.CancelWait() = 
+                                    agent.Post Cancel
+                                    this.Await()
+                                member this.CancelWaitTimeout ts = 
+                                    agent.Post Cancel
+                                    this.AwaitTimeout ts
+                            }
+                        
                         { new ExternalHandle<'T> with
-                            member __.Id = tcell.Task.Id.GetHashCode()
-                            member __.Class = 
-                                let name = tcell.Task.GetType().FullName
-                                in EffectExternal name
-                            member __.IsStarted = 
-                                tcell.Task.Status = TaskStatus.Running ||
-                                tcell.Task.Status = TaskStatus.RanToCompletion
-                            member __.IsCompleted = tcell.Task.IsCompleted
-                            member __.Start () =
-                                Async.StartWithContinuations(
-                                    comp,
-                                    (fun result -> tcell.TrySetResult result |> ignore),
-                                    (fun ex -> tcell.TrySetException ex |> ignore),
-                                    (fun cEx -> tcell.TrySetCanceled cEx.CancellationToken |> ignore),
-                                    ctoken
-                                )
-                                let token = AsyncToken tcell.Task
-                                { new AsyncHandle<'T>(token) with
-                                    member __.IsCompleted = tcell.Task.IsCompleted
-                                    member __.Await() =
-                                        if tcell.Task.IsCompletedSuccessfully then 
-                                            AsyncDone (ValueSome tcell.Task.Result)
-                                        elif tcell.Task.IsFaulted then 
-                                            AsyncFailed (ValueSome tcell.Task.Exception.InnerException)
-                                        elif tcell.Task.IsCanceled then 
-                                            AsyncCancelled ValueNone
-                                        else AsyncPending
-                                    member this.AwaitTimeout ts = 
-                                        // Simple blocking wait with timeout
-                                        if tcell.Task.Wait ts then this.Await()
-                                        else AsyncPending
-                                    member _.Cancel() = 
-                                        ctokenSrc.CancelAsync() |> ignore
-                                    member this.CancelWait() = 
-                                        ctokenSrc.Cancel()
-                                        this.Await()
-                                    member this.CancelWaitTimeout ts = 
-                                        ctokenSrc.CancelAsync() |> ignore
-                                        this.AwaitTimeout ts
-                                }
-                            override __.Dispose() = 
-                                ctokenSrc.Dispose()
-                                if  tcell.Task.Status = TaskStatus.RanToCompletion ||
-                                    tcell.Task.Status = TaskStatus.Canceled ||
-                                    tcell.Task.Status = TaskStatus.Faulted
-                                    then tcell.Task.Dispose()
+                            member _.Id = 123 //FIXME
+                            member _.Class = EffectExternal "FSharp.Control.Async"
+                            member _.IsStarted = started.IsSet
+                            member _.IsCompleted = completed.IsSet
+                            member _.Start() = 
+                                agent.PostAndReply Start
+                                createHandle()
+                            member _.Dispose() = 
+                                started.Dispose()
+                                completed.Dispose()
+                                cts.Dispose()
+                                (agent :> IDisposable).Dispose()
                         }
-                    )
-                    Classify = typeof<Task<'T>>.FullName |> EffectExternal
+                    Classify = EffectExternal "Async"
                     DebugLabel = Some "lift-async" 
                 }
             externalSpec spec
+    
+    module Async =
+        
+        /// Represents a started async operation that can be checked multiple times
+        type StartedAsync<'T> = {
+            Poll: unit -> AsyncResult<'T>          // Non-blocking check
+            Await: unit -> AsyncResult<'T>         // Blocking wait
+            AwaitTimeout: TimeSpan -> AsyncResult<'T>  // Blocking wait with timeout
+            Cancel: unit -> unit
+            IsCompleted: unit -> bool
+        }
+
+        /// Start an async computation that can be checked multiple times
+        let startAsync (asyncWork: Async<'T>) : Async<StartedAsync<'T>> =
+            async {
+                let completed = new ManualResetEventSlim(false)
+                let mutable result = AsyncPending
+                let cts = new CancellationTokenSource()
+                
+                // Start the computation with continuations
+                Async.StartWithContinuations(
+                    asyncWork,
+                    (fun value -> 
+                        result <- AsyncDone (ValueSome value)
+                        completed.Set()
+                    ),
+                    (fun ex -> 
+                        result <- AsyncFailed (ValueSome ex)
+                        completed.Set()
+                    ),
+                    (fun _ -> 
+                        result <- AsyncCancelled ValueNone
+                        completed.Set()
+                    ),
+                    cts.Token
+                )
+                
+                return {
+                    Poll = fun () -> 
+                        if completed.IsSet then result 
+                        else AsyncPending
+                    
+                    Await = fun () ->
+                        completed.Wait()
+                        result
+                    
+                    AwaitTimeout = fun timeout ->
+                        if completed.Wait(timeout) then result
+                        else AsyncPending
+                    
+                    Cancel = fun () -> cts.Cancel()
+                    
+                    IsCompleted = fun () -> completed.IsSet
+                }
+            }
+
+        /// Run async work with timeout, returning either the result or the handle to check later
+        let withTimeout (timeout: TimeSpan) (asyncWork: Async<'T>) : Flow<Choice<'T, StartedAsync<'T>>> =
+            flow {
+                // Start the async work
+                let! started = Lift.async (startAsync asyncWork)
+                
+                // Try to get result within timeout
+                match started.AwaitTimeout timeout with
+                | AsyncDone (ValueSome value) -> 
+                    return Choice1Of2 value
+                | AsyncFailed (ValueSome ex) -> 
+                    return raise ex
+                | AsyncCancelled _ -> 
+                    return raise (OperationCanceledException())
+                | _ -> 
+                    // Timeout - return the handle so caller can check later
+                    return Choice2Of2 started
+            }
+
+        /// Helper to retry a timed-out operation
+        let retryTimeout (timeout: TimeSpan) (started: StartedAsync<'T>) : Async<Choice<'T, StartedAsync<'T>>> =
+            async {
+                match started.AwaitTimeout timeout with
+                | AsyncDone (ValueSome value) -> 
+                    return Choice1Of2 value
+                | AsyncFailed (ValueSome ex) -> 
+                    return raise ex
+                | AsyncCancelled _ -> 
+                    return raise (OperationCanceledException())
+                | _ -> 
+                    // Still not ready
+                    return Choice2Of2 started
+            }
+
+        /// Example: Progressive timeout with retries
+        let withProgressiveTimeout (timeouts: TimeSpan list) (asyncWork: Async<'T>) : Flow<'T option> =
+            flow {
+                match timeouts with
+                | [] -> return None
+                | firstTimeout :: remainingTimeouts ->
+                    let! result = withTimeout firstTimeout asyncWork
+                    
+                    match result with
+                    | Choice1Of2 value -> 
+                        return Some value
+                    | Choice2Of2 started ->
+                        // Try remaining timeouts
+                        let rec tryRemaining timeouts =
+                            async {
+                                match timeouts with
+                                | [] -> return None
+                                | timeout :: rest ->
+                                    let! retryResult = retryTimeout timeout started
+                                    match retryResult with
+                                    | Choice1Of2 value -> return Some value
+                                    | Choice2Of2 _ -> return! tryRemaining rest
+                            }
+                        
+                        return! Lift.async (tryRemaining remainingTimeouts)
+            }
+
+        /// Simplified withTimeout that just returns Option (for backward compatibility)
+        let withTimeoutSimple (timeout: TimeSpan) (asyncWork: Async<'T>) : Flow<'T option> =
+            flow {
+                let! result = withTimeout timeout asyncWork
+                match result with
+                | Choice1Of2 value -> return Some value
+                | Choice2Of2 _ -> return None
+            }
+
+        /// Start multiple async operations and check them with timeout
+        let parallelWithTimeout (timeout: TimeSpan) (asyncWorks: Async<'T> list) : Flow<('T option * StartedAsync<'T>) list> =
+            flow {
+                // Start all operations
+                let! startedOps = 
+                    asyncWorks
+                    |> List.map startAsync
+                    |> Async.Parallel
+                    |> Lift.async
+                
+                // Check each with timeout
+                let! results =
+                    startedOps
+                    |> Array.map (fun started ->
+                        async {
+                            match started.AwaitTimeout timeout with
+                            | AsyncDone (ValueSome value) -> return (Some value, started)
+                            | _ -> return (None, started)
+                        }
+                    )
+                    |> Async.Parallel
+                    |> Lift.async
+                
+                return Array.toList results
+            }
+
+        /// Example usage showing the power of returning StartedAsync
+        let exampleUsage() = flow {
+            let longRunningWork = async {
+                do! Async.Sleep 5000
+                return "Finally done!"
+            }
+            
+            // Try with 1 second timeout
+            let! firstTry = withTimeout (TimeSpan.FromSeconds 1.) longRunningWork
+            
+            match firstTry with
+            | Choice1Of2 result ->
+                printfn "Got result quickly: %s" result
+                return result
+            | Choice2Of2 started ->
+                printfn "Timed out after 1 second, doing other work..."
+                
+                // Do some other work while waiting
+                do! Lift.async (Async.Sleep 2000)
+                
+                // Check again with 3 second timeout
+                let! secondTry = Lift.async (retryTimeout (TimeSpan.FromSeconds 3.) started)
+                
+                match secondTry with
+                | Choice1Of2 result ->
+                    printfn "Got result on retry: %s" result
+                    return result
+                | Choice2Of2 _ ->
+                    printfn "Still not ready, giving up"
+                    return "Default value"
+        }
+
+        /// Create a Flow that runs async work without blocking, with explicit continuation
+        let fork (asyncWork: Async<'T>) (continuation: 'T -> Flow<'R>) : Flow<'R> =
+            flow {
+                // Start the async work
+                let! result = Lift.async asyncWork
+                // Continue with the result
+                return! continuation result
+            }
+        
+        /// Create a Flow that runs multiple async operations in parallel
+        let par (asyncWorks: Async<'T> list) : Flow<'T list> =
+            flow {
+                // Start all async operations
+                let! tasks = 
+                    asyncWorks 
+                    |> List.map Lift.async 
+                    |> List.map (fun f -> flow { return! f })
+                    |> List.fold (fun acc elem ->
+                        flow {
+                            let! results = acc
+                            let! result = elem
+                            return result :: results
+                        }
+                    ) (flow { return [] })
+                return List.rev tasks
+            }
+        
+        (* /// Run async work with a timeout
+        let withTimeout (timeout: TimeSpan) (asyncWork: Async<'T>) : Flow<'T option> =
+            flow {
+                // Start the work as a child computation so it runs independently
+                let! childAsync = 
+                    Lift.async (async {
+                        let! child = Async.StartChild asyncWork
+                        return child
+                    })
+                
+                // Now race between the child and timeout
+                let timeoutComp = async {
+                    do! Async.Sleep (int timeout.TotalMilliseconds)
+                    return None
+                }
+                
+                let workComp = async {
+                    let! result = childAsync
+                    return Some result
+                }
+                
+                // This won't cancel the original work
+                let! result = Lift.async (Async.Choice [workComp; timeoutComp])
+                
+                return result
+            } *)
+
+    type FlowBuilder with
+        
+        /// Fork async work with continuation (non-blocking)
+        member __.Fork(asyncWork: Async<'T>, continuation: 'T -> Flow<'R>) : Flow<'R> =
+            Async.fork asyncWork continuation
+        
+        /// Run async operations in parallel
+        member __.Parallel(asyncWorks: Async<'T> list) : Flow<'T list> =
+            Async.par asyncWorks
+        
+        // Yield control back to scheduler (useful in loops)
+        member __.YieldControl() : Flow<unit> =
+            Lift.async (Async.SwitchToThreadPool())

@@ -92,6 +92,8 @@ type AsyncHandle<'a>(internal token: AsyncToken<'a>) =
     // NB: this would be a lot cleaner with higher kinded types...
     // abstract member AsTokenSource<'t> : unit -> 't option
 
+    abstract member Poll: unit -> AsyncResult<'a>
+
     /// Await the completion of the async operation (blocks the caller)
     abstract member Await : unit -> AsyncResult<'a>             // Blocking await
     
@@ -104,6 +106,17 @@ type AsyncHandle<'a>(internal token: AsyncToken<'a>) =
     abstract member CancelWait : unit -> AsyncResult<'a> // Cancel the async operation and wait for completion
 
     abstract member CancelWaitTimeout : TimeSpan -> AsyncResult<'a> // Cancel and wait with timeout
+
+type AsyncState<'T> =
+    | NotStarted
+    | Running of CancellationTokenSource
+    | Completed of AsyncResult<'T>
+
+type AsyncMessage<'T> =
+    | Start of AsyncReplyChannel<AsyncHandle<'T>>
+    | Query of AsyncReplyChannel<AsyncState<'T>>
+    | SetResult of AsyncResult<'T>
+    | WaitForResult of TimeSpan option * AsyncReplyChannel<AsyncResult<'T>>
 
 (* 
     Typed external (impure) operation handle.
