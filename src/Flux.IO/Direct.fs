@@ -6,7 +6,6 @@ module Direct =
     open System.Threading
     open System.Threading.Tasks
 
-
     let inline ofProg p : Flow<'T> = { prog = p }
 
     let inline pure' (x: 'T) : Flow<'T> =
@@ -27,22 +26,25 @@ module Direct =
     let inline tryFinally (m: Flow<'T>) (fin: unit -> unit) : Flow<'T> =
         { prog = FTryFinally (m.prog, fin) }
 
-    // ----------------------------------------------------------------------------------
-    // Internal Interpreter Primitive (single-step flattening).
-    // ----------------------------------------------------------------------------------
-    // runProg executes FlowProg<'T> into a ValueTask<'T>. External effects are executed
-    // by obtaining an ExternalHandle<'T> and polling/waiting (here naive blocking loop).
-    // A production version would integrate with a scheduler or event loop.
-    // ----------------------------------------------------------------------------------
+    
+    (* 
+        Note: Single-step, flattening Interpreter primitive 
 
+        Evaluating `runExternal` has runProg evaluate a FlowProg<'T> into a ValueTask<'T>. 
+        External effects are executed by obtaining an ExternalHandle<'T> and polling/waiting 
+        (currently this is a naive blocking loop).
+        
+        Integration with scheduler or event loop is TODO/FIXME.
+    *)
+    
+    
     let private runExternal 
             (env: ExecutionEnv) 
             (ct: CancellationToken) 
             (spec: ExternalSpec<'T>) : ValueTask<'T> =
-        // NOTE: This is a simplified interpretation. Improve with:
-        //  * Non-blocking integration with scheduler / registration
-        //  * Timeout / cancellation bridging
-        //  * Backpressure gating before start
+        // TODO: Non-blocking integration with scheduler / registration
+        // TODO: Timeout / cancellation bridging
+        // TODO: Backpressure gating before start
         task {
             let handle = spec.Build env
             
@@ -129,10 +131,8 @@ module Direct =
                             return raise ex
                     } |> ValueTask<'T>
 
-    // ----------------------------------------------------------------------------------
-    // Monadic Operations (no structural bind node stored)
-    // ----------------------------------------------------------------------------------
-
+    (* Monadic Operations (where no structural bind nodes are stored) *)
+    
     // Explicit generic ordering: k first, then m, helps solver keep 'A and 'B distinct.
     let inline bind<'A,'B> (k: 'A -> Flow<'B>) (m: Flow<'A>) : Flow<'B> =
         // We produce a Flow whose execution interprets m then k.
