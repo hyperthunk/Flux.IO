@@ -175,21 +175,15 @@ module Direct =
     let inline map<'A,'B> (f: 'A -> 'B) (m: Flow<'A>) : Flow<'B> =
         bind (f >> pure') m
 
-    // ----------------------------------------------------------------------------------
-    // Flow Runner
-    // ----------------------------------------------------------------------------------
-
-    /// Execute a Flow<'T>. Because bind flattened structure by embedding logic in run,
-    /// we handle composed cases in a unified run function.
+    (* 
+        Execute a Flow<'T>. Because bind flattened structure by embedding logic in run,
+        we handle composed cases in a unified run function. 
+    *)
     let run (env: ExecutionEnv) (ct: CancellationToken) (m: Flow<'T>) : ValueTask<'T> =
         // Since we used sentinel FPure/FSync scaffolding inside bind, we bypass them by
         // directly chaining at runtime:
         // Simplify: treat FSync sentinel with default value as marker— fallback to real run logic.
         execute env ct m.prog
-
-    // ----------------------------------------------------------------------------------
-    // Computation Expression Builder
-    // ----------------------------------------------------------------------------------
 
     type FlowBuilder () =
         member _.Return (x: 'T) : Flow<'T> = pure' x
@@ -245,20 +239,12 @@ module Direct =
 
     let flow = FlowBuilder()
 
-    // ----------------------------------------------------------------------------------
-    // Convenience helpers for StreamCommand construction
-    // ----------------------------------------------------------------------------------
-
     module Stream =
         let emit x = Emit x
         let emitMany xs = EmitMany xs
         let consume () = Consume
         let complete () = Complete
         let fault ex = Error ex
-
-    // ----------------------------------------------------------------------------------
-    // Task / Async lifting helpers (convert to ExternalSpec if desired)
-    // ----------------------------------------------------------------------------------
 
     module Lift =
 
@@ -508,7 +494,7 @@ module Direct =
     
     module Async =
         
-        /// Represents a started async operation that can be checked multiple times
+        // Represents a already started async operation that can be checked multiple times
         type StartedAsync<'T> = {
             Poll: unit -> AsyncResult<'T>          // Non-blocking check
             Await: unit -> AsyncResult<'T>         // Blocking wait
@@ -562,7 +548,9 @@ module Direct =
             }
 
         /// Run async work with timeout, returning either the result or the handle to check later
-        let withTimeout (timeout: TimeSpan) (asyncWork: Async<'T>) : Flow<Choice<'T, StartedAsync<'T>>> =
+        let withTimeout 
+                (timeout: TimeSpan) 
+                (asyncWork: Async<'T>) : Flow<Choice<'T, StartedAsync<'T>>> =
             flow {
                 // Start the async work
                 let! started = Lift.async (startAsync asyncWork)
@@ -581,7 +569,9 @@ module Direct =
             }
 
         /// Helper to retry a timed-out operation
-        let retryTimeout (timeout: TimeSpan) (started: StartedAsync<'T>) : Async<Choice<'T, StartedAsync<'T>>> =
+        let retryTimeout 
+                (timeout: TimeSpan) 
+                (started: StartedAsync<'T>) : Async<Choice<'T, StartedAsync<'T>>> =
             async {
                 match started.AwaitTimeout timeout with
                 | AsyncDone (ValueSome value) -> 
@@ -595,8 +585,10 @@ module Direct =
                     return Choice2Of2 started
             }
 
-        /// Example: Progressive timeout with retries
-        let withProgressiveTimeout (timeouts: TimeSpan list) (asyncWork: Async<'T>) : Flow<'T option> =
+        /// Progressive timeout with retries
+        let withProgressiveTimeout 
+                (timeouts: TimeSpan list) 
+                (asyncWork: Async<'T>) : Flow<'T option> =
             flow {
                 match timeouts with
                 | [] -> return None
@@ -622,17 +614,10 @@ module Direct =
                         return! Lift.async (tryRemaining remainingTimeouts)
             }
 
-        /// Simplified withTimeout that just returns Option (for backward compatibility)
-        let withTimeoutSimple (timeout: TimeSpan) (asyncWork: Async<'T>) : Flow<'T option> =
-            flow {
-                let! result = withTimeout timeout asyncWork
-                match result with
-                | Choice1Of2 value -> return Some value
-                | Choice2Of2 _ -> return None
-            }
-
         /// Start multiple async operations and check them with timeout
-        let parallelWithTimeout (timeout: TimeSpan) (asyncWorks: Async<'T> list) : Flow<('T option * StartedAsync<'T>) list> =
+        let parWithTimeout 
+                (timeout: TimeSpan) 
+                (asyncWorks: Async<'T> list) : Flow<('T option * StartedAsync<'T>) list> =
             flow {
                 // Start all operations
                 let! startedOps = 
@@ -657,8 +642,8 @@ module Direct =
                 return Array.toList results
             }
 
-        /// Example usage showing the power of returning StartedAsync
-        let exampleUsage() = flow {
+        // Example usage showing the power of returning StartedAsync
+        let startAsyncTest() = flow {
             let longRunningWork = async {
                 do! Async.Sleep 5000
                 return "Finally done!"
@@ -715,33 +700,8 @@ module Direct =
                     ) (flow { return [] })
                 return List.rev tasks
             }
-        
-        (* /// Run async work with a timeout
-        let withTimeout (timeout: TimeSpan) (asyncWork: Async<'T>) : Flow<'T option> =
-            flow {
-                // Start the work as a child computation so it runs independently
-                let! childAsync = 
-                    Lift.async (async {
-                        let! child = Async.StartChild asyncWork
-                        return child
-                    })
-                
-                // Now race between the child and timeout
-                let timeoutComp = async {
-                    do! Async.Sleep (int timeout.TotalMilliseconds)
-                    return None
-                }
-                
-                let workComp = async {
-                    let! result = childAsync
-                    return Some result
-                }
-                
-                // This won't cancel the original work
-                let! result = Lift.async (Async.Choice [workComp; timeoutComp])
-                
-                return result
-            } *)
+
+    (* Provide additional API surface layer for forking, parallel, etc *)
 
     type FlowBuilder with
         
