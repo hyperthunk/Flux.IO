@@ -70,8 +70,11 @@ module CoreMachine =
     open System.Threading
     open System.Threading.Tasks
     open Expecto
-    open Flux.IO.Core1
-    open Flux.IO.Core1.Flow
+    //open Flux.IO.Core1
+    //open Flux.IO.Core1.Flow
+
+    open Flux.IO.Core.Types
+    open Flux.IO.Pipeline.Direct
     open FsCheck
     open FsCheck.Experimental
     open FSharp.HashCollections
@@ -102,20 +105,24 @@ module CoreMachine =
         | Synchronous value -> 
             Flow.ret value
         | Asynchronous(value, delayMs) ->
-            Flow (fun _ ct ->
+            //TODO: FIXME - we NEED to reintroduce async operations
+            failwith "Not implemented"
+            (* Flow (fun _ ct ->
                 ValueTask<int>(task {
                     do! Task.Delay(delayMs, ct)
                     return value
-                }))
+                })) *)
         | Failing ex ->
-            Flow (fun _ _ ->
-                ValueTask<int>(Task.FromException<int>(ex)))
+            failwith "Not implemented: not even sure how these map now???"
+            (* Flow (fun _ _ ->
+                ValueTask<int>(Task.FromException<int>(ex))) *)
         | Cancelling ->
-            Flow (fun _ ct ->
+            failwith "Not implemented: cancellation needs to be refactored"
+            (* Flow (fun _ ct ->
                 ValueTask<int>(task {
                     ct.ThrowIfCancellationRequested()
                     return 0
-                }))
+                })) *)
                 
     // Generate different StreamCommand results
     let genStreamCommand<'T> (genPayload: Gen<'T>) =
@@ -147,20 +154,23 @@ module CoreMachine =
                 match behavior with
                 | Synchronous _ -> Flow.ret streamCmd
                 | Asynchronous(_, delayMs) ->
-                    Flow (fun _ ct ->
+                    failwith "Not implemented"
+                    (* Flow (fun _ ct ->
                         ValueTask<StreamCommand<'b>>(task {
                             do! Task.Delay(delayMs, ct)
                             return streamCmd
-                        }))
+                        })) *)
                 | Failing ex ->
-                    Flow (fun _ _ ->
-                        ValueTask<StreamCommand<'b>>(Task.FromException<StreamCommand<'b>>(ex)))
+                    failwith "Not implemented"
+                    (* Flow (fun _ _ ->
+                        ValueTask<StreamCommand<'b>>(Task.FromException<StreamCommand<'b>>(ex))) *)
                 | Cancelling ->
-                    Flow (fun _ ct ->
+                    failwith "Not implemented: cancellation needs to be refactored"
+                    (* Flow (fun _ ct ->
                         ValueTask<StreamCommand<'b>>(task {
                             ct.ThrowIfCancellationRequested()
                             return streamCmd
-                        }))
+                        })) *)
         }
 
     // Model for StreamProcessor behavior
@@ -201,12 +211,13 @@ module CoreMachine =
                     let result = 
                         match timeout with
                         | Some t ->
-                            let timeoutFlow = Flow.withTimeout t flowResult
-                            match Flow.run env cancellationToken timeoutFlow |> fun vt -> vt.Result with
+                            failwith "Not implemented: timeouts need to be refactored"
+                            (* let timeoutFlow = Flow.withTimeout t flowResult
+                            match run env cancellationToken timeoutFlow |> fun vt -> vt.Result with
                             | Some cmd -> cmd
-                            | None -> Error (TimeoutException())
+                            | None -> Error (TimeoutException()) *)
                         | None ->
-                            Flow.run env cancellationToken flowResult |> fun vt -> vt.Result
+                            run env cancellationToken flowResult |> fun vt -> vt.Result
                     Ok result
                 with
                 | ex -> Result.Error ex
@@ -361,7 +372,8 @@ module CoreMachine =
                             if useLogger then
                                 env.Logger.Log("INFO", sprintf "Processing %d" value)
                             if delayMs > 0 then
-                                do! Flow.liftTask (task{ do! Task.Delay delayMs })
+                                failwith "Not implemented: delays need to be refactored"
+                                // do! Flow.liftTask (task{ do! Task.Delay delayMs })
                             return sprintf "Processed: %d" value
                         }
                     return f
@@ -448,7 +460,7 @@ module CoreMachine =
                     if random.NextDouble() < failureRate then
                         return Error (InvalidOperationException("Random failure"))
                     else
-                        return Emit (mapEnvelope (fun x -> x + 1) env)
+                        return Emit (Envelope.map (fun x -> x + 1) env)
                 }
             )
 
@@ -466,8 +478,9 @@ module CoreMachine =
             StreamProcessor (fun env ->
                 flow {
                     let delay = random.Next(minDelay, maxDelay)
-                    do! liftTask (task { do! Task.Delay delay })
-                    return Emit (mapEnvelope (fun x -> x * 2) env)
+                    failwith "Not implemented: delays need to be refactored"
+                    // do! liftTask (task { do! Task.Delay delay })
+                    return Emit (Envelope.map (fun x -> x * 2) env)
                 }
             )
             

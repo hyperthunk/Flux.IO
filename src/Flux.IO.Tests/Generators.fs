@@ -1,7 +1,9 @@
 namespace Flux.IO.Tests
 
 open Flux.IO
-open Flux.IO.Core1
+// open Flux.IO.Core1
+open Flux.IO.Core.Types
+open Flux.IO.Pipeline.Direct
 open FsCheck
 open FSharp.HashCollections
 open Newtonsoft.Json
@@ -161,14 +163,13 @@ module Generators =
             let! delayMs = Gen.frequency [ 3, Gen.constant 0; 1, Gen.choose(1,5) ]
             return
                 if delayMs = 0 then
-                    Flow.ret v
+                    flow { return v }
                 else
-                    Flow (fun _ ct ->
-                        ValueTask<int>(
-                        task {
-                            do! Task.Delay(delayMs * 100, ct)
-                            return v
-                        }))
+                    // TODO: re-introduce this with a proper external handle
+                    flow {
+                        Thread.Sleep(delayMs * 100) //, ct)
+                        return v
+                    }
         }
     
     let genFlowAndFunc = 
@@ -515,19 +516,22 @@ module TestEnv =
         { Metrics = metrics :> IMetrics
           Tracer  = tracer  :> ITracer
           Logger  = logger  :> ILogger
-          Memory  = DummyPool() :> IMemoryPool },
+          Memory  = DummyPool() :> IMemoryPool 
+          NowUnix = fun () -> DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+          //Services = Map.empty
+        },
         metrics, tracer, logger
 
     let runFlow (f: Flow<'a>) =
         let env,_,_,_ = mkEnv()
-        let vt = Flow.run env CancellationToken.None f
+        let vt = run env CancellationToken.None f
         if vt.IsCompletedSuccessfully then vt.Result
         else vt.AsTask().Result
 
     let flowEq1 (f1: Flow<'a>) (f2: Flow<'a>) =
         let env,_,_,_ = mkEnv()
-        let r1 = Flow.run env CancellationToken.None f1
-        let r2 = Flow.run env CancellationToken.None f2
+        let r1 = run env CancellationToken.None f1
+        let r2 = run env CancellationToken.None f2
         let v1 = if r1.IsCompletedSuccessfully then Choice1Of2 r1.Result else Choice2Of2 (r1.AsTask().Result)
         let v2 = if r2.IsCompletedSuccessfully then Choice1Of2 r2.Result else Choice2Of2 (r2.AsTask().Result)
         // Compare results (both succeed)
@@ -541,7 +545,7 @@ module TestEnv =
         
         // Always get the actual result, regardless of sync/async
         let getResult (f: Flow<'a>) =
-            let vt = Flow.run env ct f
+            let vt = run env ct f
             if vt.IsCompletedSuccessfully then 
                 vt.Result
             else 
@@ -558,8 +562,8 @@ module TestEnv =
         let env,_,_,_ = mkEnv()
         let ct = CancellationToken.None
         
-        let vt1 = Flow.run env ct f1
-        let vt2 = Flow.run env ct f2
+        let vt1 = run env ct f1
+        let vt2 = run env ct f2
         
         // Both complete synchronously or both complete asynchronously
         vt1.IsCompletedSuccessfully = vt2.IsCompletedSuccessfully

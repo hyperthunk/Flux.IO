@@ -6,25 +6,27 @@ module Direct =
     open System.Threading
     open System.Threading.Tasks
 
-    let inline ofProg p : Flow<'T> = { prog = p }
+    let inline ofProg p : Flow<'T> = { Program = p }
 
     let inline pure' (x: 'T) : Flow<'T> =
-        { prog = FPure (fun () -> x) }
+        { Program = FPure (fun () -> x) }
+
+    let inline liftF (x: 'T) : Flow<'T> = pure' x
 
     let inline sync (f: ExecutionEnv -> 'T) : Flow<'T> =
-        { prog = FSync f }
+        { Program = FSync f }
 
     let inline externalSpec (spec: ExternalSpec<'T>) : Flow<'T> =
-        { prog = FExternal spec }
+        { Program = FExternal spec }
 
     let inline delay (thunk: unit -> Flow<'T>) : Flow<'T> =
-        { prog = FDelay (fun () -> (thunk()).prog) }
+        { Program = FDelay (fun () -> (thunk()).Program) }
 
     let inline tryWith (m: Flow<'T>) (handler: exn -> Flow<'T>) : Flow<'T> =
-        { prog = FTryWith (m.prog, fun ex -> (handler ex).prog) }
+        { Program = FTryWith (m.Program, fun ex -> (handler ex).Program) }
 
     let inline tryFinally (m: Flow<'T>) (fin: unit -> unit) : Flow<'T> =
-        { prog = FTryFinally (m.prog, fin) }
+        { Program = FTryFinally (m.Program, fin) }
 
     
     (* 
@@ -157,7 +159,7 @@ module Direct =
                 FPure (fun () -> Unchecked.defaultof<'B>)
             )
         // Wrap in a Flow with a customized execute (decorate with metadata if needed)
-        { prog =
+        { Program =
             // Use delay so side-effects of m/k construction (should be none) deferred.
             FDelay (fun () ->
                 // We create a tiny trampoline by returning a pure node that, when executed through execute,
@@ -175,6 +177,9 @@ module Direct =
     let inline map<'A,'B> (f: 'A -> 'B) (m: Flow<'A>) : Flow<'B> =
         bind (f >> pure') m
 
+    let inline apply (mf: Flow<'a -> 'b>) (ma: Flow<'a>) : Flow<'b> =
+        bind (fun f -> map f ma) mf
+
     (* 
         Execute a Flow<'T>. Because bind flattened structure by embedding logic in run,
         we handle composed cases in a unified run function. 
@@ -183,7 +188,7 @@ module Direct =
         // Since we used sentinel FPure/FSync scaffolding inside bind, we bypass them by
         // directly chaining at runtime:
         // Simplify: treat FSync sentinel with default value as marker— fallback to real run logic.
-        execute env ct m.prog
+        execute env ct m.Program
 
     type FlowBuilder () =
         member _.Return (x: 'T) : Flow<'T> = pure' x
@@ -716,3 +721,53 @@ module Direct =
         // Yield control back to scheduler (useful in loops)
         member __.YieldControl() : Flow<unit> =
             Lift.async (Async.SwitchToThreadPool())
+
+    module StreamProcessor =
+
+        let ask : Flow<ExecutionEnv> = sync id
+
+        // Access execution environment
+        let withEnv (f: ExecutionEnv -> 'a -> Flow<'b>) : StreamProcessor<'a, 'b> =
+            StreamProcessor (fun env ->
+                flow {
+                    let! execEnv = ask
+                    let! result = f execEnv env.Payload
+                    return Emit (Envelope.map (fun _ -> result) env)
+                }
+            )
+
+        // Monadic bind for stream processors
+        let bind 
+                (f: 'b -> StreamProcessor<'b, 'c>) 
+                (StreamProcessor p: StreamProcessor<'a, 'b>) : StreamProcessor<'a, 'c> =
+            StreamProcessor (fun env ->
+                flow {
+                    let! execEnv = ask
+                    let! cmd = p env
+                    match cmd with
+                    | Emit outEnv ->
+                        // outEnv has type Envelope<'b>, which is what we need
+                        let (StreamProcessor g) = f outEnv.Payload
+                        return! g outEnv
+                    | EmitMany envs ->
+                        let results : Envelope<'c> list = []
+                        let ems = 
+                            envs 
+                            |> Seq.fold (fun acc outEnv ->
+                                // Each outEnv has type Envelope<'b>
+                                let (StreamProcessor g) = f outEnv.Payload
+
+                                // TODO: FIXME - we have to force the processor in order to bind here,
+                                // but does this perhaps break the laziness approach when we're in Freer mode?
+                                let res = g outEnv |> run execEnv CancellationToken.None
+                                match res.Result with
+                                | Emit e -> e :: acc
+                                | EmitMany es -> es @ acc
+                                | _ -> acc
+                            ) results
+                        return EmitMany (ems |> List.ofSeq)
+                    | Consume -> return Consume
+                    | Complete -> return Complete
+                    | Error e -> return Error e
+                }
+            )

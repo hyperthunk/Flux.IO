@@ -7,8 +7,10 @@ module JsonStreamProcessors =
     open System.Buffers
     open Newtonsoft.Json.Linq
     open Flux.IO
-    open Flux.IO.Core1
-    open Flux.IO.Core1.Flow
+    (* open Flux.IO.Core1
+    open Flux.IO.Core1.Flow *)
+    open Flux.IO.Core.Types
+    open Flux.IO.Pipeline.Direct
 
     module JsonAssembler =
 
@@ -50,14 +52,14 @@ module JsonStreamProcessors =
         module AssemblerProcessor =
             let create (assembler: IJsonAssembler<JToken>) : StreamProcessor<ReadOnlyMemory<byte>, JToken> =
                 StreamProcessor (fun (env: Envelope<ReadOnlyMemory<byte>>) ->
-                    Flow.flow {
+                    flow {
                         if assembler.Completed then
                             return Complete
                         else
                             match assembler.Feed env.Payload with
                             | StatusNeedMore -> return Consume
                             | StatusComplete tok ->
-                                let outE = mapEnvelope (fun _ -> tok) env
+                                let outE = Envelope.map (fun _ -> tok) env
                                 return Emit outE
                             | StatusError ex -> return Error ex
                     })

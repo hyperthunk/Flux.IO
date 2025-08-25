@@ -5,8 +5,10 @@ open System.Text
 open Newtonsoft.Json.Linq
 open FSharp.HashCollections
 open Flux.IO
-open Flux.IO.Core1
-open Flux.IO.Core1.Flow
+// open Flux.IO.Core1
+// open Flux.IO.Core1.Flow
+open Flux.IO.Core.Types
+open Flux.IO.Pipeline.Direct
 open Generators.JsonGenerators
 
 open IntegrationStages
@@ -116,7 +118,7 @@ module CoreIntegrationPipeline =
         let private runProc<'a,'b> (ctx: ExecContext) (proc: StreamProcessor<'a,'b>) (payload: 'a) =
             let envl = Envelope.create 0L payload
             StreamProcessor.runProcessor proc envl
-            |> Flow.run ctx.Env CancellationToken.None
+            |> run ctx.Env CancellationToken.None
             |> fun vt -> vt.Result
 
         type DirectRuntimeState =

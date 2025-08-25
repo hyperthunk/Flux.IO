@@ -2,7 +2,7 @@ namespace Flux.IO.Core.Types
 
 open FSharp.Control
 open FSharp.HashCollections
-open FSharpPlus
+// open FSharpPlus
 open System.Collections.Generic
 open System
 open System.Threading
@@ -49,6 +49,23 @@ type Envelope<'T> = {
             Ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
             Attrs = HashMap.empty
             Cost = { Bytes = 0; CpuHint = 0.0 }
+        }
+
+    static member map f (env: Envelope<'T>) : Envelope<'U> =
+        {
+            Payload = f env.Payload
+            Headers = env.Headers
+            SeqId = env.SeqId
+            SpanCtx = env.SpanCtx
+            Ts = env.Ts
+            Attrs = env.Attrs
+            Cost = env.Cost
+        }
+    
+    static member mapHeaders f (env: Envelope<'T>) : Envelope<'T> =
+        {
+            env with 
+                Headers = f env.Headers
         }
 
 type Batch<'T> = {
@@ -133,10 +150,33 @@ type ExternalHandle<'T> =
     abstract member IsCompleted : bool
     abstract member Start       : unit -> AsyncHandle<'T>
 
-type ExecutionEnv =
-    { log      : string -> unit
-      nowUnix  : unit -> int64
-      services : Map<string,obj> }
+type IMetrics =
+    abstract RecordCounter: name: string * tags: HashMap<string,string> * value: int64 -> unit
+    abstract RecordGauge: name: string * tags: HashMap<string,string> * value: float -> unit
+    abstract RecordHistogram: name: string * tags: HashMap<string,string> * value: float -> unit
+
+type ITracer =
+    abstract StartSpan: name: string -> parent: TraceContext option -> TraceContext
+    abstract EndSpan: ctx: TraceContext -> unit
+    abstract AddEvent: ctx: TraceContext -> name:string -> attrs:HashMap<string,obj> -> unit
+
+[<Interface>]
+type ILogger =
+    abstract member Log: level:string * message: string -> unit
+    abstract member LogError: message: string * exn: exn -> unit
+
+type IMemoryPool =
+    abstract RentBuffer: size:int -> ArraySegment<byte>
+    abstract ReturnBuffer: buffer: ArraySegment<byte> -> unit
+
+type ExecutionEnv = { 
+    Metrics  : IMetrics
+    Tracer   : ITracer
+    Logger   : ILogger
+    Memory   : IMemoryPool
+    NowUnix  : unit -> int64
+    //Services : Map<string,obj> 
+}
 
 type ExternalSpec<'T> =
     { 
@@ -147,8 +187,8 @@ type ExternalSpec<'T> =
 
 // Stream command DU (reused by pipeline processors)
 type StreamCommand<'T> =
-    | Emit of 'T
-    | EmitMany of 'T list
+    | Emit of Envelope<'T>
+    | EmitMany of Envelope<'T> list
     | Consume
     | Complete
     | Error of exn
@@ -172,4 +212,75 @@ type FlowProg<'T> =
     | FTryFinally of FlowProg<'T> * (unit -> unit)
 
 /// The public Flow wrapper (kept opaque to allow internal evolution).
-type Flow<'T> = { prog: FlowProg<'T> }
+type Flow<'T> = 
+    { 
+        Program: FlowProg<'T> 
+    }
+
+module Flow =
+    let inline ret (x: 'a) : Flow<'a> = 
+        { Program = FPure (fun () -> x) }
+
+    let inline zero () : Flow<unit> = 
+        { Program = FPure (fun () -> ()) }
+
+type StreamProcessor<'TIn, 'TOut> = 
+    | StreamProcessor of (Envelope<'TIn> -> Flow<StreamCommand<'TOut>>)
+
+module StreamProcessor =
+
+    // Run a processor on a single envelope
+    let runProcessor (StreamProcessor f) env = f env
+    
+    // Lift a pure function into a processor
+    let lift (f: 'a -> 'b) : StreamProcessor<'a, 'b> =
+        StreamProcessor (fun env ->
+            { Program = FSync (fun _ -> Emit (Envelope.map f env)) }
+        )
+
+    // Filter processor
+    let filter (predicate: 'a -> bool) : StreamProcessor<'a, 'a> =
+        StreamProcessor (fun env ->
+            {
+                Program = FSync (fun _ ->
+                    if predicate env.Payload then
+                        Emit env
+                    else
+                        Consume
+                )
+            }
+        )
+
+    // Stateful processor
+    let stateful 
+            (initial: 'state) 
+            (f: 'state -> 'a -> ('state * 'b option)) : StreamProcessor<'a, 'b> =
+        let state = ref initial
+        StreamProcessor (fun env ->
+            {
+                Program = FSync (fun _ ->
+                    let newState, result = f state.Value env.Payload
+                    state.Value <- newState
+                    match result with
+                    | Some value -> 
+                        Emit (Envelope.map (fun _ -> value) env)
+                    | None -> Consume
+                )
+            }
+        )
+
+(*     let withEnv (f: ExecutionEnv -> 'a -> Flow<'b>) : StreamProcessor<'a, 'b> =
+        StreamProcessor (fun env ->
+            {
+                Program = FSync (fun execEnv ->
+                    let result = f execEnv env.Payload
+                    Emit (Envelope.map (fun _ -> result) env)
+                )
+            }
+        )
+ *)
+
+module Core = 
+    open FSharpPlus
+
+    let inline flip f x y = FSharpPlus.Operators.flip f x y

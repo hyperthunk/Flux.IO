@@ -4,9 +4,13 @@ namespace Flux.IO.Pipeline
 Key Refactoring Changes
 
 Removed dependency on Core1: Now uses the Direct API types from Flux.IO.Core.Types and Flux.IO.Pipeline.Direct
+
 Changed StreamProcessor to simple functions: Instead of a StreamProcessor type, we use functions that return Flow<StreamCommand<'T>>. This fits better with the Direct API's compositional style.
+
 Stateful processing: The createStatefulProcessor helper manages assembler state across multiple calls, which is necessary for streaming JSON assembly.
+
 Flow-based composition: All processors now return Flow values that can be composed using the Direct API's monadic operations.
+
 Simplified API: The high-level Processors module provides easy-to-use functions for different JSON parsing strategies.
 
 Usage Pattern
@@ -79,7 +83,8 @@ module JsonStreamProcessors =
                 member _.Completed = doneFlag
 
         /// Create a Flow-based processor from an assembler
-        let createProcessor (assembler: IJsonAssembler<JToken>) : Envelope<ReadOnlyMemory<byte>> -> Flow<StreamCommand<JToken>> =
+        let createProcessor 
+            (assembler: IJsonAssembler<JToken>) : Envelope<ReadOnlyMemory<byte>> -> Flow<StreamCommand<JToken>> =
             fun (env: Envelope<ReadOnlyMemory<byte>>) ->
                 flow {
                     if assembler.Completed then
@@ -295,27 +300,27 @@ module JsonStreamProcessors =
         let pipeline (processors: (Envelope<'a> -> Flow<StreamCommand<'b>>) list) =
             fun (initialEnv: Envelope<'a>) ->
                 flow {
-                    let rec process (env: Envelope<'x>) (procs: (Envelope<'x> -> Flow<StreamCommand<'y>>) list) =
+                    let rec proc (env: Envelope<'x>) (procs: (Envelope<'x> -> Flow<StreamCommand<'y>>) list) =
                         flow {
                             match procs with
                             | [] -> return Complete
-                            | proc :: rest ->
-                                let! cmd = proc env
+                            | proc' :: rest ->
+                                let! cmd = proc' env
                                 match cmd with
                                 | Emit outEnv ->
                                     // Type inference issue here - would need existential types
                                     // For now, this is a sketch of the pattern
-                                    return! process (unbox outEnv) (unbox rest)
+                                    return! proc (unbox outEnv) (unbox rest)
                                 | EmitMany envs ->
                                     for e in envs do
-                                        do! process (unbox e) (unbox rest) |> ignore
+                                        do! proc (unbox e) (unbox rest) |> ignore
                                     return Consume
                                 | Consume -> return Consume
                                 | Complete -> return Complete
                                 | Error ex -> return Error ex
                         }
                     
-                    return! process initialEnv (unbox processors)
+                    return! proc initialEnv (unbox processors)
                 }
 
     /// Example usage

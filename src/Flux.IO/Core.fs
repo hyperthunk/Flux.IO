@@ -35,11 +35,7 @@
     - Easy testing of processors (without worrying about long-running state)
     - Natural batching point for processing multiple envelopes concurrently
 
-    Next Steps
-
-    what we've built is perfect for the synchronous, envelope-by-envelope processing model, and we shouldn't change it. Instead, we need to layer on top of it to support the more complex scenarios you've described.
-
-    Key Architectural Insights
+    Key Architectural Concerns
 
     Granularity Control: We need to control when async tasks are spawned - not for every token, but for meaningful work units (complete documents, batches, etc.)
     Long-Running vs On-Demand: Some stages need to run continuously (socket readers), while others should activate on-demand (JSON parsers)
@@ -47,7 +43,6 @@
     Parallel Sub-Pipelines: Stages that internally parallelize work using different execution engines
     Lifecycle Management: Some pipelines run forever, others complete and need to be recreated
 
-    Proposed Layered Architecture
     We need to distinguish between:
 
     - Processing Logic (what we built with Flow/StreamProcessor) - handles individual envelopes
