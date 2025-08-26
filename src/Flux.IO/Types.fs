@@ -149,6 +149,7 @@ type AsyncMessage<'T> =
 
 (* 
     Typed external (impure) operation handle.
+    
     This is a *descriptor* + lifecycle controller. Creation does NOT start the effect.
     A backend decides when to call Start() and how to await completion.
     No backend-specific types (Task / Job / etc.) leak through this surface. 
