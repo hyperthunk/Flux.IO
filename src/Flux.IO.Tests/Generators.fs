@@ -524,16 +524,17 @@ module TestEnv =
 
     let runFlow (f: Flow<'a>) =
         let env,_,_,_ = mkEnv()
-        let vt = run env CancellationToken.None f
-        if vt.IsCompletedSuccessfully then vt.Result
-        else vt.AsTask().Result
+        let vt = run env (* CancellationToken.None *) f
+        (* if vt.IsCompletedSuccessfully then vt.Result
+        else vt.AsTask().Result *)
+        vt.Result
 
     let flowEq1 (f1: Flow<'a>) (f2: Flow<'a>) =
         let env,_,_,_ = mkEnv()
-        let r1 = run env CancellationToken.None f1
-        let r2 = run env CancellationToken.None f2
-        let v1 = if r1.IsCompletedSuccessfully then Choice1Of2 r1.Result else Choice2Of2 (r1.AsTask().Result)
-        let v2 = if r2.IsCompletedSuccessfully then Choice1Of2 r2.Result else Choice2Of2 (r2.AsTask().Result)
+        let r1 = run env (* CancellationToken.None *) f1
+        let r2 = run env (* CancellationToken.None *) f2
+        let v1 = if r1.IsCompleted then Choice1Of2 r1.Result else Choice2Of2 r1
+        let v2 = if r2.IsCompleted then Choice1Of2 r2.Result else Choice2Of2 r2
         // Compare results (both succeed)
         match v1, v2 with
         | Choice1Of2 a, Choice1Of2 b -> a = b
@@ -541,15 +542,16 @@ module TestEnv =
 
     let flowEq (f1: Flow<'a>) (f2: Flow<'a>) =
         let env,_,_,_ = mkEnv()
-        let ct = CancellationToken.None
+        (* let ct = CancellationToken.None *)
         
         // Always get the actual result, regardless of sync/async
         let getResult (f: Flow<'a>) =
-            let vt = run env ct f
-            if vt.IsCompletedSuccessfully then 
+            let vt = run env (* ct *) f
+            (* if vt.IsCompletedSuccessfully then 
                 vt.Result
             else 
-                vt.AsTask().Result
+                vt.AsTask().Result *)
+            vt.Result
         
         try
             let v1 = getResult f1
@@ -560,10 +562,10 @@ module TestEnv =
 
     let hasSameCompletionBehavior (f1: Flow<'a>) (f2: Flow<'a>) =
         let env,_,_,_ = mkEnv()
-        let ct = CancellationToken.None
+        (* let ct = CancellationToken.None *)
         
-        let vt1 = run env ct f1
-        let vt2 = run env ct f2
-        
+        let vt1 = run env (* ct *) f1
+        let vt2 = run env (* ct *) f2
+
         // Both complete synchronously or both complete asynchronously
-        vt1.IsCompletedSuccessfully = vt2.IsCompletedSuccessfully
+        vt1.IsCompleted = vt2.IsCompleted

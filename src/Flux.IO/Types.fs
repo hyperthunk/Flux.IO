@@ -104,12 +104,110 @@ type EffectClass =
 
 type BackendToken<'a> = internal BackendToken of obj
 
+(*
+    Note: on `Either<'L, 'R>` and `EffectResult<'A>` semantics.
+
+    We allow for `EffectResult<'T>` to hold a "no-op" as its outcome, by virtue of using
+    `ValueOption` semantics. This representation of the absence of a result, can be used
+    to short-circuit computations across heterogeneous concurrency contexts.
+*)
+
+[<Struct>]
+type Either<'L, 'R> =
+    | Left  of result: 'L
+    | Right of error: 'R
+    | Neither with
+
+    member this.ValueLeft =
+        match this with
+        | Left l  -> ValueSome l
+        | Right r -> ValueNone
+        | Neither -> ValueNone
+
+    member this.ValueRight =
+        match this with
+        | Right r -> ValueSome r
+        | Left l  -> ValueNone
+        | Neither -> ValueNone
+
+    static member map (f: 'L -> 'U) (e: Either<'L,'R>) : Either<'U,'R> =
+        match e with
+        | Left l -> Left (f l)
+        | Right r -> Right r
+        | Neither -> Neither
+    
+    static member mapError (f: 'R -> 'U) (e: Either<'L,'R>) : Either<'L,'U> =
+        match e with
+        | Left l -> Left l
+        | Right r -> Right (f r)
+        | Neither -> Neither
+    
+    static member bind (e: Either<'L,'R>, binder: 'L -> Either<'U,'R>) : Either<'U,'R> =
+        match e with
+        | Left l -> binder l
+        | Right r -> Right r
+        | Neither -> Neither
+
 [<Struct>]
 type EffectResult<'a> =
-    | AsyncDone      of result: 'a voption
-    | AsyncFailed    of reason: exn voption
-    | AsyncCancelled of reason: exn voption
-    | AsyncPending
+    | EffectDone      of result: 'a voption
+    | EffectFailed    of reason: exn
+    | EffectCancelled of reason: exn
+    | EffectPending with 
+        
+        member this.Result = 
+            match this with
+            | EffectPending -> raise (InvalidOperationException "Effect is still pending")
+            | EffectDone (ValueSome result) -> Left result
+            | EffectDone ValueNone -> Neither
+            | EffectFailed ex -> Right ex
+            | EffectCancelled ex -> Right ex
+
+        member this.IsCompleted = 
+            match this with
+            | EffectPending -> false
+            | _ -> true
+    
+        member this.IsPending = not this.IsCompleted        
+
+        member this.Failed =
+            match this with
+            | EffectFailed _ -> true
+            | _ -> false
+
+        member this.Succeeded = not this.Failed
+
+module EffectResult =
+    let inline map ([<InlineIfLambda>] mapping) result =
+        match result with
+        | EffectFailed e -> EffectFailed e
+        | EffectDone (ValueSome x) -> EffectDone (ValueSome (mapping x))
+        | EffectDone ValueNone -> EffectDone ValueNone
+        | EffectCancelled e -> EffectCancelled e
+        | EffectPending -> EffectPending
+
+    let inline mapResult ([<InlineIfLambda>] mapping) result =
+        Either.map mapping result
+
+    let inline mapError ([<InlineIfLambda>] mapping) result =
+        match result with
+        | EffectFailed e -> EffectFailed (mapping e)
+        | EffectDone (ValueSome x) -> EffectDone (ValueSome x)
+        | EffectDone ValueNone -> EffectDone ValueNone
+        | EffectCancelled e -> EffectCancelled e
+        | EffectPending -> EffectPending
+
+    let inline bind ([<InlineIfLambda>] binder) result =
+        map binder result
+    
+    let inline pure' x = EffectDone (ValueSome x)
+
+    let ret = pure'
+
+    let inline unwrap (result: EffectResult<'a>) : 'a =
+        match result with
+        | EffectDone (ValueSome x) -> x
+        | _ -> raise (InvalidOperationException "Effect does not produce a value")
 
 [<AbstractClass>]
 type EffectHandle<'a>(internal token: BackendToken<'a>) =

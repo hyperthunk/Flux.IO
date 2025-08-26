@@ -6,20 +6,12 @@ module Direct =
     open System.Threading
     open System.Threading.Tasks
 
-    // Ambient state to make the current CancellationToken available to FSync bind sequencing
-    // without changing DU shapes or introducing boxing/sentinels.
-    module Ambient =
-    
-        /// This has a horrible name because YOU SHOULD NOT BE USING IT. It is only public
-        /// because inlining will break if it is internal or private. 
-        /// 
-        /// This should NOT be touched by user facing code.
-        let __internal_CT = new AsyncLocal<CancellationToken>()
-
     let inline ofProg p : Flow<'T> = { Program = p }
 
     let inline pure' (x: 'T) : Flow<'T> =
         { Program = FPure (fun () -> x) }
+    
+    let ret = pure'
 
     let inline liftF (x: 'T) : Flow<'T> = pure' x
 
@@ -52,109 +44,73 @@ module Direct =
     
     let runExternal 
             (env: ExecutionEnv) 
-            (ct: CancellationToken) 
-            (spec: ExternalSpec<'T>) : ValueTask<'T> =
+            (* (ct: CancellationToken) *) 
+            (spec: ExternalSpec<'T>) : EffectResult<'T> =
         // TODO: Non-blocking integration with scheduler / registration
         // TODO: Timeout / cancellation bridging
         // TODO: Backpressure gating before start
-        task {
-            let handle = spec.Build env
-            
-            if handle.IsStarted then
-                raise (InvalidOperationException "External effect is already started")
+        let handle = spec.Build env
+        
+        if handle.IsStarted then
+            raise (InvalidOperationException "External effect is already started")
 
-            let asyncHandle = handle.Start()
-            
-            // Register cancellation
-            use _ = ct.Register(fun () -> 
-                try asyncHandle.Cancel()
-                with _ -> ()
-            )
-            
-            // Simply wait for the result
-            let result =
-                try asyncHandle.Await()
-                with ex ->
-                    // Await should not throw; normalize to AsyncFailed
-                    AsyncFailed (ValueSome ex)
-            
-            match result with
-            | AsyncDone (ValueSome v) -> 
-                return v
-            | AsyncDone ValueNone -> 
-                return raise (InvalidOperationException "External completed with no value")
-            | AsyncFailed (ValueSome ex) -> 
-                return raise ex
-            | AsyncFailed ValueNone -> 
-                return raise (Exception "Unknown external failure")
-            | AsyncCancelled (ValueSome oce) ->
-                // Prefer preserving the provided OCE, but ensure token is visible
-                if ct.IsCancellationRequested then
-                    return raise (OperationCanceledException("Operation cancelled", oce, ct))
-                else
-                    return raise oce
-            | AsyncCancelled ValueNone ->
-                return raise (OperationCanceledException(ct))
-            | AsyncPending ->
-                // Should not happen after Await()
-                return raise (InvalidOperationException "Await returned Pending")
-        } |> ValueTask<'T>
+        let asyncHandle = handle.Start()
+        
+        // Register cancellation
+        (* use _ = ct.Register(fun () -> 
+            try asyncHandle.Cancel()
+            with _ -> ()
+        ) *)
+        
+        // Simply wait for the result
+        let result =
+            try asyncHandle.Await()
+            with ex ->
+                // Await should not throw; normalize to AsyncFailed
+                EffectFailed ex
+
+        match result with
+        | EffectDone (ValueSome _) ->
+            result
+        | EffectDone ValueNone -> 
+            raise (InvalidOperationException "External completed with no value")
+        | EffectFailed ex -> 
+            raise ex
+        | EffectCancelled oce ->
+            // Prefer preserving the provided OCE, but ensure token is visible
+            raise oce
+        | EffectPending ->
+            // Should not happen after Await()
+            raise (InvalidOperationException "Await returned Pending")
 
     let rec execute 
             (env: ExecutionEnv) 
-            (ct: CancellationToken) 
-            (prog: FlowProg<'T>) : ValueTask<'T> =
-        if ct.IsCancellationRequested then
-            ValueTask<'T>(Task.FromCanceled<'T> ct)
-        else
-            match prog with
-            | FPure th ->
-                try ValueTask<'T>(th())
-                with ex -> ValueTask<'T>(Task.FromException<'T> ex)
-            | FSync f ->
-                try ValueTask<'T>(f env)
-                with ex -> ValueTask<'T>(Task.FromException<'T> ex)
-            | FExternal spec ->
-                runExternal env ct spec
-            | FDelay thunk ->
-                // Do not evaluate thunk early; just proceed when executed
-                try execute env ct (thunk())
-                with ex -> ValueTask<'T>(Task.FromException<'T> ex)
-            | FTryWith (body, handler) ->
-                let vt = execute env ct body
-                if vt.IsCompletedSuccessfully then
-                    ValueTask<'T> vt.Result
-                else
-                    task {
-                        try
-                            return! vt.AsTask()
-                        with ex ->
-                            // Build the handler program; if handler throws, escalate
-                            let hProg =
-                                try handler ex
-                                with hex -> 
-                                    FTryWith(FPure(fun () -> raise hex), 
-                                            fun _ -> FPure(fun () -> raise hex)) // escalate
-                            return! execute env ct hProg |> fun v -> v.AsTask()
-                    } |> ValueTask<'T>
-            | FTryFinally (body, fin) ->
-                let vt = execute env ct body
-                if vt.IsCompletedSuccessfully then
-                    try
-                        fin()
-                        ValueTask<'T> vt.Result
-                    with exFin ->
-                        ValueTask<'T>(Task.FromException<'T> exFin)
-                else
-                    task {
-                        try
-                            let! r = vt
-                            fin()
-                            return r
-                        with ex ->
-                            try fin() with _ -> ()
-                            return raise ex
-                    } |> ValueTask<'T>
+            (* (ct: CancellationToken)  *)
+            (prog: FlowProg<'T>) : EffectResult<'T> =
+        match prog with
+        | FPure th ->
+            try th() |> ValueSome |> EffectDone
+            with ex -> EffectFailed ex
+        | FSync f ->
+            try f env |> ValueSome |> EffectDone
+            with ex -> EffectFailed ex
+        | FExternal spec ->
+            runExternal env (* ct *) spec
+        | FDelay thunk ->
+            // Do not evaluate thunk early; just proceed when executed
+            try execute env (* ct *) (thunk())
+            with ex -> EffectFailed ex
+        | FTryWith (body, handler) ->
+            try execute env body
+            with ex -> execute env (handler ex)
+        | FTryFinally (body, fin) ->
+            try
+                let result = execute env body
+                fin()
+                result
+            with ex ->
+                fin()
+                reraise()
 
     (* Monadic Operations (where no structural bind nodes are stored) *)
     
@@ -171,15 +127,38 @@ module Direct =
     let inline bind<'A,'B> (k: 'A -> Flow<'B>) (m: Flow<'A>) : Flow<'B> =
         { Program =
             FSync (fun env ->
-                let ct = Ambient.__internal_CT.Value
+                (* let ct = Ambient.__internal_CT.Value
                 let a =
                     let vt = execute env ct m.Program
                     if vt.IsCompletedSuccessfully then vt.Result else vt.AsTask().Result
                 let b =
                     let vt2 = execute env ct (k a).Program
                     if vt2.IsCompletedSuccessfully then vt2.Result else vt2.AsTask().Result
-                b) }
-    
+                b *)
+                (* let a = execute env m.Program
+                let b = execute env (k a).Program *)
+                match execute env m.Program with
+                | EffectDone (ValueSome a) -> 
+                    match execute env (k a).Program with
+                    | EffectDone (ValueSome b) -> b
+                    | EffectDone ValueNone -> 
+                        raise (InvalidOperationException "Bind continuation completed with no value")
+                    | EffectFailed ex -> 
+                        raise ex
+                    | EffectCancelled oce -> 
+                        raise oce
+                    | EffectPending -> 
+                        raise (InvalidOperationException "Bind continuation returned Pending")
+                | EffectDone ValueNone -> 
+                    raise (InvalidOperationException "Bind continuation completed with no value")
+                | EffectFailed ex -> 
+                    raise ex
+                | EffectCancelled oce -> 
+                    raise oce
+                | EffectPending -> 
+                    raise (InvalidOperationException "Bind continuation returned Pending")
+            ) }
+
     (* let inline bind<'A,'B> (k: 'A -> Flow<'B>) (m: Flow<'A>) : Flow<'B> =
         // We produce a Flow whose execution interprets m then k.
         // This does lose intermediate structural shape (acceptable for "Direct" mode).
@@ -228,18 +207,12 @@ module Direct =
         Execute a Flow<'T>. Because bind flattened structure by embedding logic in run,
         we handle composed cases in a unified run function. 
     *)
-    let run (env: ExecutionEnv) (ct: CancellationToken) (m: Flow<'T>) : ValueTask<'T> =
+    let run (env: ExecutionEnv) (* (ct: CancellationToken) *) (m: Flow<'T>) : EffectResult<'T> =
         // PREVIOUS:
         // Since we used sentinel FPure/FSync scaffolding inside bind, we bypass them by
         // directly chaining at runtime:
         // Simplify: treat FSync sentinel with default value as marker— fallback to real run logic.
-        // CURRENT: set ambient CT for nested FSync/Bind to observe
-        let prev = Ambient.__internal_CT.Value
-        Ambient.__internal_CT.Value <- ct
-        try
-            execute env ct m.Program
-        finally
-            Ambient.__internal_CT.Value <- prev
+       execute env (* ct *) m.Program
 
     type FlowBuilder () =
         member _.Return (x: 'T) : Flow<'T> = pure' x
@@ -314,11 +287,11 @@ module Direct =
                 let ex =
                     if isNull ae.InnerException then (ae :> exn)
                     else ae.InnerException
-                AsyncFailed (ValueSome ex)
+                EffectFailed ex
             | :? OperationCanceledException as oce ->
-                AsyncCancelled (ValueSome oce)
+                EffectCancelled oce
             | ex ->
-                AsyncFailed (ValueSome ex)
+                EffectFailed ex
 
         /// Lift a Task<'T> by eagerly wrapping as ExternalSpec (simple adapter).
         let task(factory: unit -> Task<'T>) : Flow<'T> =
@@ -346,18 +319,18 @@ module Direct =
                                     
                                     member _.Poll() =
                                         if task.IsCompletedSuccessfully then 
-                                            AsyncDone (ValueSome task.Result)
+                                            EffectDone (ValueSome task.Result)
                                         elif task.IsFaulted then 
                                             let ex =
                                                 match task.Exception with
                                                 | null -> null
                                                 | ae when isNull ae.InnerException -> ae :> exn
                                                 | ae -> ae.InnerException
-                                            if isNull ex then AsyncFailed ValueNone
-                                            else AsyncFailed (ValueSome ex)
+                                            if isNull ex then EffectFailed (Exception())
+                                            else EffectFailed ex
                                         elif task.IsCanceled then 
-                                            AsyncCancelled ValueNone
-                                        else AsyncPending
+                                            EffectCancelled (OperationCanceledException())
+                                        else EffectPending
                                     
                                     member this.Await() =
                                         tryWrap (fun() -> 
@@ -370,7 +343,7 @@ module Direct =
                                             if task.Wait(ts) then 
                                                 this.Poll()
                                             else 
-                                                AsyncPending
+                                                EffectPending
                                         )
                                     
                                     member _.Cancel() = () //TODO: actually cancel it?
@@ -413,19 +386,19 @@ module Direct =
                                 
                                 member _.Poll() =
                                     if task.IsCompletedSuccessfully then
-                                        AsyncDone (ValueSome task.Result)
+                                        EffectDone (ValueSome task.Result)
                                     elif task.IsFaulted then
                                         let ex =
                                             match task.Exception with
                                             | null -> null
                                             | ae when Object.ReferenceEquals(ae.InnerException, null) -> ae :> exn
                                             | ae -> ae.InnerException
-                                        if isNull ex then AsyncFailed ValueNone
-                                        else AsyncFailed (ValueSome ex)
+                                        if isNull ex then EffectFailed (Exception())
+                                        else EffectFailed ex
                                     elif task.IsCanceled then
-                                        AsyncCancelled ValueNone
+                                        EffectCancelled (OperationCanceledException())
                                     else
-                                        AsyncPending
+                                        EffectPending
                                 
                                 member this.Await() =
                                     tryWrap (fun() -> 
@@ -436,7 +409,7 @@ module Direct =
                                 member this.AwaitTimeout ts =
                                     tryWrap (fun() -> 
                                         if task.Wait ts then this.Poll()
-                                        else AsyncPending
+                                        else EffectPending
                                     )
                                 
                                 member _.Cancel() = cts.Cancel()
@@ -493,22 +466,22 @@ module Direct =
                     { new EffectHandle<'T>(BackendToken taskRef) with
                         member _.IsCompleted = taskRef.IsCompleted
                         member _.Poll() =
-                            if taskRef.IsCompletedSuccessfully then AsyncDone (ValueSome taskRef.Result)
+                            if taskRef.IsCompletedSuccessfully then EffectDone (ValueSome taskRef.Result)
                             elif taskRef.IsFaulted then
                                 let ex =
                                     match taskRef.Exception with
                                     | null -> null
                                     | ae when isNull ae.InnerException -> ae :> exn
                                     | ae -> ae.InnerException
-                                if isNull ex then AsyncFailed ValueNone
-                                else AsyncFailed (ValueSome ex)
-                            elif taskRef.IsCanceled then AsyncCancelled ValueNone
-                            else AsyncPending
+                                if isNull ex then EffectFailed (Exception())
+                                else EffectFailed ex
+                            elif taskRef.IsCanceled then EffectCancelled (OperationCanceledException())
+                            else EffectPending
                         member this.Await() =
                             taskRef.Wait()
                             this.Poll()
                         member this.AwaitTimeout ts =
-                            if taskRef.Wait ts then this.Poll() else AsyncPending
+                            if taskRef.Wait ts then this.Poll() else EffectPending
                         member _.Cancel() = cancellation()
                         member this.CancelWait() = 
                             this.Cancel()
@@ -610,7 +583,7 @@ module Direct =
                             // Start new effect for this envelope
                             let flowHandle = start envIn.Payload
                             // Direct.run variant (simplified) – in Direct path binds are sync
-                            let rec run env ct prog =
+                            let rec run env (* ct *) prog =
                                 match prog with
                                 | FPure th -> th()
                                 | FSync f -> f env
@@ -622,31 +595,31 @@ module Direct =
                                     // BLOCKING semantics for FExternal in Direct path remain, but
                                     // for correctness we attempt to await. If this is reached it's a fallback.
                                     match ah.Await() with
-                                    | AsyncDone (ValueSome v) -> v
-                                    | AsyncFailed (ValueSome ex) -> raise ex
-                                    | AsyncCancelled (ValueSome oce) -> raise oce
+                                    | EffectDone (ValueSome v) -> v
+                                    | EffectFailed ex -> raise ex
+                                    | EffectCancelled oce -> raise oce
                                     | _ -> failwith "Unexpected pending external in forkSingle fallback path."
-                                | FDelay th -> run env ct (th())
+                                | FDelay th -> run env (* ct *) (th())
                                 | FTryWith (body, handler) ->
-                                    try run env ct body
-                                    with ex -> run env ct (handler ex)
+                                    try run env (* ct *) body
+                                    with ex -> run env (* ct *) (handler ex)
                                 | FTryFinally (body, fin) ->
                                     try
-                                        let r = run env ct body
+                                        let r = run env (* ct *) body
                                         fin()
                                         r
                                     with _ ->
                                         fin()
                                         reraise()
-                            let handle = run execEnv CancellationToken.None flowHandle.Program
+                            let handle = run execEnv (* CancellationToken.None *) flowHandle.Program
                             state <- Running (envIn, handle, execEnv.NowUnix())
                             Consume
                         | Running (orig, handle, startedAt) ->
                             let res = handle.Poll()
                             match res with
-                            | AsyncPending ->
+                            | EffectPending ->
                                 Consume
-                            | AsyncDone (ValueSome value) ->
+                            | EffectDone (ValueSome value) ->
                                 let latencyMs = execEnv.NowUnix() - startedAt
                                 let outPayload = project orig value
                                 let baseEnv = mapPayload outPayload orig
@@ -659,24 +632,16 @@ module Direct =
                                     }
                                 state <- Idle
                                 Emit outEnv
-                            | AsyncFailed (ValueSome ex) ->
+                            | EffectFailed ex ->
                                 state <- Faulted ex
                                 Error ex
-                            | AsyncCancelled (ValueSome oce) ->
+                            | EffectCancelled oce ->
                                 state <- Faulted oce
                                 Error oce
-                            | AsyncDone ValueNone ->
+                            | EffectDone ValueNone ->
                                 // Consider treating as protocol error
                                 state <- Faulted (InvalidOperationException "Effect completed without value.")
                                 Error (InvalidOperationException "Empty effect result")
-                            | AsyncFailed ValueNone ->
-                                let ex = InvalidOperationException "Unknown effect failure"
-                                state <- Faulted ex
-                                Error ex
-                            | AsyncCancelled ValueNone ->
-                                let ex = OperationCanceledException()
-                                state <- Faulted ex
-                                Error ex
                         | Emitting _ ->
                             // Transitional state not currently used – treat as Complete
                             state <- Idle
@@ -709,7 +674,7 @@ module Direct =
                     Build = fun _ ->
                         let started = new ManualResetEventSlim(false)
                         let completed = new ManualResetEventSlim(false)
-                        let mutable result = AsyncPending
+                        let mutable result = EffectPending
                         let cts = new CancellationTokenSource()
                         
                         let agent = MailboxProcessor<AsyncMessage<'T>>.Start(fun inbox ->
@@ -721,15 +686,15 @@ module Direct =
                                     Async.StartWithContinuations(
                                         comp,
                                         (fun value -> 
-                                            result <- AsyncDone (ValueSome value)
+                                            result <- EffectDone (ValueSome value)
                                             completed.Set()
                                         ),
                                         (fun ex -> 
-                                            result <- AsyncFailed (ValueSome ex)
+                                            result <- EffectFailed ex
                                             completed.Set()
                                         ),
                                         (fun _ -> 
-                                            result <- AsyncCancelled ValueNone
+                                            result <- EffectCancelled (OperationCanceledException())
                                             completed.Set()
                                         ),
                                         cts.Token
@@ -738,13 +703,13 @@ module Direct =
                                     reply.Reply()
                                     return! running()
                                 | Poll reply ->
-                                    reply.Reply AsyncPending
+                                    reply.Reply EffectPending
                                     return! notStarted()
                                 | Wait reply ->
-                                    reply.Reply AsyncPending
+                                    reply.Reply EffectPending
                                     return! notStarted()
                                 | WaitTimeout (_, reply) ->
-                                    reply.Reply AsyncPending
+                                    reply.Reply EffectPending
                                     return! notStarted()
                                 | Cancel ->
                                     return! notStarted()
@@ -757,7 +722,7 @@ module Direct =
                                     reply.Reply() // Already started
                                     return! running()
                                 | Poll reply ->
-                                    reply.Reply (if completed.IsSet then result else AsyncPending)
+                                    reply.Reply (if completed.IsSet then result else EffectPending)
                                     return! running()
                                 | Wait reply ->
                                     // Spawn async to wait
@@ -772,7 +737,7 @@ module Direct =
                                         if completed.Wait(ts) then
                                             reply.Reply result
                                         else
-                                            reply.Reply AsyncPending
+                                            reply.Reply EffectPending
                                     } |> Async.Start
                                     return! running()
                                 | Cancel ->
@@ -833,22 +798,22 @@ module Direct =
         let startAsync (asyncWork: Async<'T>) : Async<StartedAsync<'T>> =
             async {
                 let completed = new ManualResetEventSlim(false)
-                let mutable result = AsyncPending
+                let mutable result = EffectPending
                 let cts = new CancellationTokenSource()
                 
                 // Start the computation with continuations
                 Async.StartWithContinuations(
                     asyncWork,
                     (fun value -> 
-                        result <- AsyncDone (ValueSome value)
+                        result <- EffectDone (ValueSome value)
                         completed.Set()
                     ),
                     (fun ex -> 
-                        result <- AsyncFailed (ValueSome ex)
+                        result <- EffectFailed ex
                         completed.Set()
                     ),
                     (fun _ -> 
-                        result <- AsyncCancelled ValueNone
+                        result <- EffectCancelled (OperationCanceledException())
                         completed.Set()
                     ),
                     cts.Token
@@ -857,7 +822,7 @@ module Direct =
                 return {
                     Poll = fun () -> 
                         if completed.IsSet then result 
-                        else AsyncPending
+                        else EffectPending
                     
                     Await = fun () ->
                         completed.Wait()
@@ -865,7 +830,7 @@ module Direct =
                     
                     AwaitTimeout = fun timeout ->
                         if completed.Wait(timeout) then result
-                        else AsyncPending
+                        else EffectPending
                     
                     Cancel = fun () -> cts.Cancel()
                     
@@ -883,12 +848,12 @@ module Direct =
                 
                 // Try to get result within timeout
                 match started.AwaitTimeout timeout with
-                | AsyncDone (ValueSome value) -> 
+                | EffectDone (ValueSome value) -> 
                     return Choice1Of2 value
-                | AsyncFailed (ValueSome ex) -> 
+                | EffectFailed ex -> 
                     return raise ex
-                | AsyncCancelled _ -> 
-                    return raise (OperationCanceledException())
+                | EffectCancelled ex -> 
+                    return raise ex
                 | _ -> 
                     // Timeout - return the handle so caller can check later
                     return Choice2Of2 started
@@ -900,12 +865,12 @@ module Direct =
                 (started: StartedAsync<'T>) : Async<Choice<'T, StartedAsync<'T>>> =
             async {
                 match started.AwaitTimeout timeout with
-                | AsyncDone (ValueSome value) -> 
+                | EffectDone (ValueSome value) -> 
                     return Choice1Of2 value
-                | AsyncFailed (ValueSome ex) -> 
+                | EffectFailed ex -> 
                     return raise ex
-                | AsyncCancelled _ -> 
-                    return raise (OperationCanceledException())
+                | EffectCancelled ex -> 
+                    return raise ex
                 | _ -> 
                     // Still not ready
                     return Choice2Of2 started
@@ -958,7 +923,7 @@ module Direct =
                     |> Array.map (fun started ->
                         async {
                             match started.AwaitTimeout timeout with
-                            | AsyncDone (ValueSome value) -> return (Some value, started)
+                            | EffectDone (ValueSome value) -> return (Some value, started)
                             | _ -> return (None, started)
                         }
                     )
@@ -1081,10 +1046,10 @@ module Direct =
 
                                 // TODO: FIXME - we have to force the processor in order to bind here,
                                 // but does this perhaps break the laziness approach when we're in Freer mode?
-                                let res = g outEnv |> run execEnv CancellationToken.None
+                                let res = g outEnv |> run execEnv (* CancellationToken.None *)
                                 match res.Result with
-                                | Emit e -> e :: acc
-                                | EmitMany es -> es @ acc
+                                | Left (Emit e) -> e :: acc
+                                | Left (EmitMany es) -> es @ acc
                                 | _ -> acc
                             ) results
                         return EmitMany (ems |> List.ofSeq)

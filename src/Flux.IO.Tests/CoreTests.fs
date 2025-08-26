@@ -55,7 +55,7 @@ module CoreTests =
             testPropertyWithConfig 
                     stdConfig 
                     "Flow.ret returns value (fast path)" <| fun (x: int) ->
-                runFlow (Flow.ret x) = x
+                runFlow (Flow.ret x) = Left x
 
             testPropertyWithConfig 
                     stdConfig 
@@ -151,7 +151,7 @@ module CoreTests =
 
             testCase "ask returns exact environment instance" <| fun () ->
                 let env,_,_,_ = TestEnv.mkEnv()
-                let got = run env CancellationToken.None StreamProcessor.ask
+                let got = run env (* CancellationToken.None *) StreamProcessor.ask
                 Expect.isTrue (Object.ReferenceEquals(env, got.Result)) "Environment identity must match"
 
             // TODO: FIXME - reintroduce or refactor local
@@ -223,11 +223,11 @@ module CoreTests =
                     let env0,metrics,_,_ = mkEnv()
                     let resVT = 
                         StreamProcessor.runProcessor proc env 
-                        |> run env0 CancellationToken.None
+                        |> run env0 (* CancellationToken.None *)
                     
                     let res = resVT.Result
                     match res with
-                    | StreamCommand.Emit outEnv -> outEnv.Payload = f env.Payload
+                    | Left (StreamCommand.Emit outEnv) -> outEnv.Payload = f env.Payload
                     | _ -> false
 
             testPropertyWithConfig 
@@ -238,12 +238,12 @@ module CoreTests =
                     let env0,_,_,_ = mkEnv()
                     let out = 
                         StreamProcessor.runProcessor proc env 
-                        |> run env0 CancellationToken.None 
+                        |> run env0 (* CancellationToken.None *) 
                         |> fun vt -> vt.Result
                     
                     match pred env.Payload, out with
-                    | true, StreamCommand.Emit o -> o.Payload = env.Payload
-                    | false, StreamCommand.Consume -> true
+                    | true, Left (StreamCommand.Emit o) -> o.Payload = env.Payload
+                    | false, Left StreamCommand.Consume -> true
                     | _ -> false
 
             testCase "stateful emits only when Some returned" <| fun _ ->
@@ -274,12 +274,12 @@ module CoreTests =
                     inputs
                     |> List.map (fun i -> 
                         StreamProcessor.runProcessor collector (mkEnv i) 
-                        |> run env0 CancellationToken.None 
+                        |> run env0 (* CancellationToken.None *) 
                         |> fun vt -> vt.Result)
                 
                 let emittedSums =
                     outputs
-                    |> List.choose (function StreamCommand.Emit e -> Some e.Payload | _ -> None)
+                    |> List.choose (function Left (StreamCommand.Emit e) -> Some e.Payload | _ -> None)
                 Expect.sequenceEqual emittedSums [1+2+3; 4+5+6] "Should emit two sums (7 incomplete)"
 
             testCase "withEnv accesses metrics and increments counter" <| fun _ ->
@@ -303,11 +303,11 @@ module CoreTests =
                     }
                 let res = 
                     StreamProcessor.runProcessor proc envIn 
-                    |> run env0 CancellationToken.None 
+                    |> run env0 (* CancellationToken.None *) 
                     |> fun vt -> vt.Result
                 
                 match res with
-                | Emit outEnv ->
+                | Left (StreamCommand.Emit outEnv) ->
                     Expect.equal outEnv.Payload 15 "Transformed"
                     let hits = metrics.Counters.TryGetValue "hit" |> function | true,v -> v | _ -> 0L
                     Expect.equal hits 1L "Counter incremented"
@@ -395,11 +395,11 @@ module CoreTests =
                 // step SUT
                 let res = 
                     StreamProcessor.runProcessor proc env 
-                    |> run env0 CancellationToken.None 
+                    |> run env0 (* CancellationToken.None *) 
                     |> fun vt -> vt.Result
                 
                 match res with
-                | Emit e -> sutOutputs <- e.Payload :: sutOutputs
+                | Left (StreamCommand.Emit e) -> sutOutputs <- e.Payload :: sutOutputs
                 | _ -> ()
                 
                 // step model

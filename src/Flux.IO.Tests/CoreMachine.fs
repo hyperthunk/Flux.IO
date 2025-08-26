@@ -205,22 +205,21 @@ module CoreMachine =
             let mutable env, _, _, _ = mkEnv()
             
             member _.Process(envelope: Envelope<'TIn>, ?timeout: TimeSpan, ?ct: CancellationToken) =
-                let cancellationToken = defaultArg ct CancellationToken.None
+                (* let cancellationToken = defaultArg ct CancellationToken.None *)
                 try
                     let flowResult = StreamProcessor.runProcessor processor envelope
-                    let result = 
-                        match timeout with
-                        | Some t ->
-                            failwith "Not implemented: timeouts need to be refactored"
-                            (* let timeoutFlow = Flow.withTimeout t flowResult
-                            match run env cancellationToken timeoutFlow |> fun vt -> vt.Result with
-                            | Some cmd -> cmd
-                            | None -> Error (TimeoutException()) *)
-                        | None ->
-                            run env cancellationToken flowResult |> fun vt -> vt.Result
-                    Ok result
+                    match timeout with
+                    | Some t ->
+                        failwith "Not implemented: timeouts need to be refactored"
+                        (* let timeoutFlow = Flow.withTimeout t flowResult
+                        match run env cancellationToken timeoutFlow |> fun vt -> vt.Result with
+                        | Some cmd -> cmd
+                        | None -> Error (TimeoutException()) *)
+                    | None ->
+                        run env (* cancellationToken *) flowResult |> fun vt -> vt.Result
+                    (* Ok result *)
                 with
-                | ex -> Result.Error ex
+                | ex -> Right ex
                 
         // Operations for the state machine
         type ProcessEnvelopeOp<'TIn, 'TOut>(envelope: Envelope<'TIn>) =
@@ -231,25 +230,27 @@ module CoreMachine =
                 
             override _.Check(sut, model) =
                 match sut.Process envelope with
-                | Ok (Emit outEnv) ->
+                | Left (Emit outEnv) ->
                     let _newModel = { model with OutputsEmitted = outEnv :: model.OutputsEmitted }
                     Prop.label "Emit" true
-                | Ok (EmitMany outEnvs) ->
+                | Left (EmitMany outEnvs) ->
                     let _newModel = { model with OutputsEmitted = outEnvs @ model.OutputsEmitted }
                     Prop.label (sprintf "EmitMany(%d)" outEnvs.Length) true
-                | Ok Consume ->
+                | Left Consume ->
                     let _newModel = { model with RequireMoreCount = model.RequireMoreCount + 1 }
                     Prop.label "RequireMore" true
-                | Ok Complete ->
+                | Left Complete ->
                     let _newModel = { model with CompletedCount = model.CompletedCount + 1 }
                     Prop.label "Complete" true
-                | Ok (Error ex) ->
+                | Left (Error ex) ->
                     let _newModel = { model with ErrorCount = model.ErrorCount + 1; LastError = Some ex }
                     Prop.label (sprintf "Error: %s" ex.Message) true
-                | Result.Error ex ->
+                | Right ex ->
                     let _newModel = { model with ErrorCount = model.ErrorCount + 1; LastError = Some ex }
-                    Prop.label (sprintf "Exception: %s" ex.Message) true
-                    
+                    Prop.label (sprintf "Error: %s" ex.Message) true
+                | Neither ->
+                    Prop.label "Neither (cannot verify behavior)" true
+
             override _.ToString() = sprintf "ProcessEnvelope(%A)" envelope.Payload
                 
         type ProcessWithTimeoutOp<'TIn, 'TOut>(envelope: Envelope<'TIn>, timeout: TimeSpan) =
@@ -260,12 +261,14 @@ module CoreMachine =
                 
             override _.Check(sut, _model) =
                 match sut.Process(envelope, timeout) with
-                | Ok result ->
+                | Left result ->
                     Prop.label (sprintf "Timeout OK: %A" result) true
-                | Result.Error ex ->
+                | Right ex ->
                     let isTimeout = ex :? TimeoutException
                     Prop.label (sprintf "Timeout Error (timeout=%b): %s" isTimeout ex.Message) true
-                    
+                | Neither ->
+                    Prop.label "Neither (cannot verify timeout behavior)" true
+
             override _.ToString() = sprintf "ProcessWithTimeout(%A, %A)" envelope.Payload timeout
                 
 
@@ -562,12 +565,12 @@ module CoreMachine =
                     )
                     
                 let failurePred = function
-                    | Result.Error _ 
-                    | Ok (StreamCommand.Error _) -> true 
+                    | Right _ 
+                    | Left (StreamCommand.Error _) -> true 
                     | _ -> false
 
                 let successPred = function
-                    | Ok (StreamCommand.Emit _) -> true
+                    | Left (StreamCommand.Emit _) -> true
                     | _ -> false
 
                 let failures = results |> List.filter failurePred |> List.length
@@ -624,9 +627,9 @@ module CoreMachine =
                 for i in 1..trials do
                     let env = Envelope.create<_> (int64 i) i
                     match sut.Process(env) with
-                    | Ok (StreamCommand.Emit _) -> actualSuccesses <- actualSuccesses + 1
-                    | Ok (StreamCommand.Error _) 
-                    | Result.Error _ -> actualFailures <- actualFailures + 1
+                    | Left (StreamCommand.Emit _) -> actualSuccesses <- actualSuccesses + 1
+                    | Left (StreamCommand.Error _) 
+                    | Right _ -> actualFailures <- actualFailures + 1
                     | _ -> () // Should not happen with this processor
 
                 let label = 
@@ -647,16 +650,19 @@ module CoreMachine =
                 let timeout = TimeSpan.FromMilliseconds(float (max + 100))
                 
                 match sut.Process(env, timeout) with
-                | Ok (StreamCommand.Emit result) -> 
+                | Left (StreamCommand.Emit result) -> 
                     result.Payload = 84
                     |> Prop.label "Delayed processor completed with correct result"
-                | Ok other ->
+                | Left other ->
                     false
                     |> Prop.label (sprintf "Unexpected result: %A" other)
-                | Result.Error ex ->
+                | Right ex ->
                     false
                     |> Prop.label (sprintf "Error: %s" ex.Message)
-                    
+                | Neither ->
+                    false
+                    |> Prop.label "Neither (cannot verify timeout behavior)"
+
             testCase "complex accumulator emits after threshold" <| fun () ->
                 let processor = ErrorScenarios.createComplexAccumulator 5
                 let sut = StreamProcessorModel.ProcessorSut(processor)
@@ -671,7 +677,7 @@ module CoreMachine =
                 let emitted = 
                     results 
                     |> List.choose (function 
-                        | Ok (StreamCommand.Emit env) -> Some env.Payload 
+                        | Left (StreamCommand.Emit env) -> Some env.Payload 
                         | _ -> None)
                         
                 Expect.equal (List.length emitted) 2 "Should emit twice (at 5 and 10 items)"
