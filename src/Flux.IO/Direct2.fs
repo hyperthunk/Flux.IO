@@ -29,7 +29,7 @@ module Direct =
         { Program = FTryFinally (m.Program, fin) }
 
     
-    (* 
+    (*
         Note: Single-step, flattening Interpreter primitive 
 
         Evaluating `runExternal` has runProg evaluate a FlowProg<'T> into a ValueTask<'T>. 
@@ -48,26 +48,24 @@ module Direct =
         // TODO: Timeout / cancellation bridging
         // TODO: Backpressure gating before start
         task {
-            let handle = spec.Build env
-            
-            if handle.IsStarted then
-                raise (InvalidOperationException "External effect is already started")
+            use handle = spec.Build env
 
+            // Always call Start once to obtain an AsyncHandle for this effect instance
             let asyncHandle = handle.Start()
             
-            // Register cancellation
-            use _ = ct.Register(fun () -> 
+            // Bridge cancellation
+            use _reg = ct.Register(fun () ->
                 try asyncHandle.Cancel()
                 with _ -> ()
             )
             
-            // Simply wait for the result
+            // Block the current thread waiting for the outcome (direct path)
             let result =
                 try asyncHandle.Await()
                 with ex ->
                     // Await should not throw; normalize to AsyncFailed
                     AsyncFailed (ValueSome ex)
-            
+
             match result with
             | AsyncDone (ValueSome v) -> 
                 return v
@@ -122,8 +120,9 @@ module Direct =
                             let hProg =
                                 try handler ex
                                 with hex -> 
+                                    // escalate
                                     FTryWith(FPure(fun () -> raise hex), 
-                                            fun _ -> FPure(fun () -> raise hex)) // escalate
+                                             fun _ -> FPure(fun () -> raise hex))
                             return! execute env ct hProg |> fun v -> v.AsTask()
                     } |> ValueTask<'T>
             | FTryFinally (body, fin) ->
@@ -145,45 +144,29 @@ module Direct =
                             return raise ex
                     } |> ValueTask<'T>
 
-    (* Monadic Operations (where no structural bind nodes are stored) *)
+    (*
+        Execute a Flow<'T>. Because bind currently flattens sequencing by performing
+        synchronous waits (blocking), run simply executes the program tree.
+        
+        NOTE: When you later move to a structural bind or managed scheduler, run can
+        become non-blocking and integrate with a poller/event loop.
+    *)
+    let run (env: ExecutionEnv) (ct: CancellationToken) (m: Flow<'T>) : ValueTask<'T> =
+        execute env ct m.Program
+
+    (* Monadic Operations (temporary, blocking sequencing for composition) *)
     
     // Explicit generic ordering: k first, then m, helps solver keep 'A and 'B distinct.
     let inline bind<'A,'B> (k: 'A -> Flow<'B>) (m: Flow<'A>) : Flow<'B> =
-        // We produce a Flow whose execution interprets m then k.
-        // This does lose intermediate structural shape (acceptable for "Direct" mode).
-        let prog =
-            FDelay (fun () ->
-                // We reify an execution closure:
-                // 1. Evaluate m (at runtime), then run k with its value.
-                // Represent as pseudo-sync wrapper capturing m & k; actual sequencing in execute below.
-                // We encode it using FSync + then value-thunk; but to preserve lazy semantics we choose a Delay chain.
-                FPure (fun () -> Unchecked.defaultof<'B>) // placeholder sentinel; real logic in specialized execute below
-            )
-        // We override execution path via a custom wrapper Flow:
-        // Simpler approach: store a closure inside an FSync returning an inner program.
-        // We'll adopt a specialized "composed" program removed from public exposure:
-        let composed =
-            // custom internal node via Delay -> run m -> run k
-            FDelay (fun () ->
-                // Markers: we can't store heterogenous result in DU; we run it directly inside execute via nested calls.
-                // We'll embed the runtime evaluation strategy in a pseudo pure node calling both sequences.
-                // NOTE: This is intentionally minimal; advanced planning requires Freer translation.
-                FPure (fun () -> Unchecked.defaultof<'B>)
-            )
-        // Wrap in a Flow with a customized execute (decorate with metadata if needed)
-        { Program =
-            // Use delay so side-effects of m/k construction (should be none) deferred.
-            FDelay (fun () ->
-                // We create a tiny trampoline by returning a pure node that, when executed through execute,
-                // calls m, then k with result.
-                FSync (fun env ->
-                    // Because execute returns ValueTask, we need synchronous fallback only if m is sync-fast.
-                    // For general case we fallback to async bridging; handled downstream by run (Flow.run).
-                    // We stash env for async path below (Flow.run handles asynchronous flattening).
-                    // The direct approach here: we just indicate a sentinel; real sequencing in runBind below.
-                    // This sentinel is consumed by runBind.
-                    Unchecked.defaultof<'B>
-                )) }
+        // For now, we sequence by running m to completion, then k a, both synchronously.
+        // This preserves semantics for pure/sync code and unblocks the law tests.
+        // WARNING: This will block a thread for external/async code paths.
+        { Program = 
+            FSync (fun env ->
+                let a = run env CancellationToken.None m |> fun vt -> vt.Result
+                let b = run env CancellationToken.None (k a) |> fun vt -> vt.Result
+                b)
+        }
 
     // map implemented via bind -> return
     let inline map<'A,'B> (f: 'A -> 'B) (m: Flow<'A>) : Flow<'B> =
@@ -192,15 +175,9 @@ module Direct =
     let inline apply (mf: Flow<'a -> 'b>) (ma: Flow<'a>) : Flow<'b> =
         bind (fun f -> map f ma) mf
 
-    (* 
-        Execute a Flow<'T>. Because bind flattened structure by embedding logic in run,
-        we handle composed cases in a unified run function. 
-    *)
-    let run (env: ExecutionEnv) (ct: CancellationToken) (m: Flow<'T>) : ValueTask<'T> =
-        // Since we used sentinel FPure/FSync scaffolding inside bind, we bypass them by
-        // directly chaining at runtime:
-        // Simplify: treat FSync sentinel with default value as marker— fallback to real run logic.
-        execute env ct m.Program
+    // catch helper: capture exceptions into Result<'T,exn>
+    let catch (m: Flow<'T>) : Flow<Result<'T, exn>> =
+        tryWith (map Ok m) (fun ex -> pure' (Error ex))
 
     type FlowBuilder () =
         member _.Return (x: 'T) : Flow<'T> = pure' x
@@ -265,27 +242,13 @@ module Direct =
 
     module Lift =
 
-        let private tryWrap body =
-            try
-                body()
-            with
-            | :? AggregateException as ae ->
-                let ex =
-                    if isNull ae.InnerException then (ae :> exn)
-                    else ae.InnerException
-                AsyncFailed (ValueSome ex)
-            | :? OperationCanceledException as oce ->
-                AsyncCancelled (ValueSome oce)
-            | ex ->
-                AsyncFailed (ValueSome ex)
-
         /// Lift a Task<'T> by eagerly wrapping as ExternalSpec (simple adapter).
         let task(factory: unit -> Task<'T>) : Flow<'T> =
             let spec =
                 { 
                     Build = fun _ ->
                         let mutable task = Unchecked.defaultof<Task<'T>>
-                        let started = new ManualResetEventSlim(false)                        
+                        let started = new ManualResetEventSlim(false)
                         
                         { new ExternalHandle<'T> with
                             member _.Id = 123 // factory.GetHashCode()
@@ -293,7 +256,7 @@ module Direct =
                             member _.IsStarted = started.IsSet
                             member _.IsCompleted = 
                                 started.IsSet && not (isNull task) && task.IsCompleted
-
+                            
                             member _.Start() =
                                 if not started.IsSet then
                                     task <- factory()
@@ -310,7 +273,7 @@ module Direct =
                                             let ex =
                                                 match task.Exception with
                                                 | null -> null
-                                                | ae when isNull ae.InnerException -> ae :> exn
+                                                | ae when Object.ReferenceEquals(ae.InnerException, null) -> ae :> exn
                                                 | ae -> ae.InnerException
                                             if isNull ex then AsyncFailed ValueNone
                                             else AsyncFailed (ValueSome ex)
@@ -319,20 +282,36 @@ module Direct =
                                         else AsyncPending
                                     
                                     member this.Await() =
-                                        tryWrap (fun() -> 
+                                        try
                                             task.Wait()
                                             this.Poll()
-                                        )
+                                        with
+                                        | :? AggregateException as ae ->
+                                            let ex =
+                                                if isNull ae.InnerException then (ae :> exn)
+                                                else ae.InnerException
+                                            AsyncFailed (ValueSome ex)
+                                        | :? OperationCanceledException as oce ->
+                                            AsyncCancelled (ValueSome oce)
+                                        | ex ->
+                                            AsyncFailed (ValueSome ex)
                                     
                                     member this.AwaitTimeout ts = 
-                                        tryWrap (fun() ->
-                                            if task.Wait(ts) then 
-                                                this.Poll()
-                                            else 
-                                                AsyncPending
-                                        )
+                                        try
+                                            if task.Wait(ts) then this.Poll()
+                                            else AsyncPending
+                                        with
+                                        | :? AggregateException as ae ->
+                                            let ex =
+                                                if isNull ae.InnerException then (ae :> exn)
+                                                else ae.InnerException
+                                            AsyncFailed (ValueSome ex)
+                                        | :? OperationCanceledException as oce ->
+                                            AsyncCancelled (ValueSome oce)
+                                        | ex ->
+                                            AsyncFailed (ValueSome ex)
                                     
-                                    member _.Cancel() = () //TODO: actually cancel it?
+                                    member _.Cancel() = ()
                                     member this.CancelWait() = this.Await()
                                     member this.CancelWaitTimeout ts = this.AwaitTimeout ts
                                 }
@@ -387,16 +366,34 @@ module Direct =
                                         AsyncPending
                                 
                                 member this.Await() =
-                                    tryWrap (fun() -> 
+                                    try
                                         task.Wait()
                                         this.Poll()
-                                    )
+                                    with
+                                    | :? AggregateException as ae ->
+                                        let ex =
+                                            if isNull ae.InnerException then (ae :> exn)
+                                            else ae.InnerException
+                                        AsyncFailed (ValueSome ex)
+                                    | :? OperationCanceledException as oce ->
+                                        AsyncCancelled (ValueSome oce)
+                                    | ex ->
+                                        AsyncFailed (ValueSome ex)
                                 
                                 member this.AwaitTimeout ts =
-                                    tryWrap (fun() -> 
+                                    try
                                         if task.Wait ts then this.Poll()
                                         else AsyncPending
-                                    )
+                                    with
+                                    | :? AggregateException as ae ->
+                                        let ex =
+                                            if isNull ae.InnerException then (ae :> exn)
+                                            else ae.InnerException
+                                        AsyncFailed (ValueSome ex)
+                                    | :? OperationCanceledException as oce ->
+                                        AsyncCancelled (ValueSome oce)
+                                    | ex ->
+                                        AsyncFailed (ValueSome ex)
                                 
                                 member _.Cancel() = cts.Cancel()
                                 
