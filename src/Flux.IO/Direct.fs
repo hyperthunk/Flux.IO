@@ -9,6 +9,11 @@ module Direct =
     // Ambient state to make the current CancellationToken available to FSync bind sequencing
     // without changing DU shapes or introducing boxing/sentinels.
     module Ambient =
+    
+        /// This has a horrible name because YOU SHOULD NOT BE USING IT. It is only public
+        /// because inlining will break if it is internal or private. 
+        /// 
+        /// This should NOT be touched by user facing code.
         let __internal_CT = new AsyncLocal<CancellationToken>()
 
     let inline ofProg p : Flow<'T> = { Program = p }
@@ -581,11 +586,22 @@ module Direct =
         open Flux.IO.Core.Types
 
         /// Internal state for a single in-flight offloaded effect.
+        /// The previous implementation used a record update `{ orig with Payload = outPayload }`
+        /// which forces `'In` = `'Out` because record update cannot change a generic type parameter.
+        /// We now construct a new envelope via `Envelope.map` (or manual copy) to preserve polymorphism.
         type private SingleForkState<'In,'Eff,'Out> =
             | Idle
             | Running of original: Envelope<'In> * handle: EffectHandle<'Eff> * startedAt: int64
-            | Emitting of Envelope<'Out>
             | Faulted of exn
+        
+        let private mapPayload<'In,'Out> (payload:'Out) (e:Envelope<'In>) : Envelope<'Out> =
+            { Payload = payload
+              Headers = e.Headers
+              SeqId = e.SeqId
+              SpanCtx = e.SpanCtx
+              Ts = e.Ts
+              Attrs = e.Attrs
+              Cost = e.Cost }
 
         /// Offload one effect per input envelope, emit result later.
         /// Behaviour:
@@ -609,38 +625,37 @@ module Direct =
                         | Idle ->
                             // Start new effect for this envelope
                             let flowHandle = start envIn.Payload
-                            let handleVT =
-                                // Direct.run variant (simplified) – in Direct path binds are sync
-                                let rec run env ct prog =
-                                    match prog with
-                                    | FPure th -> th()
-                                    | FSync f -> f env
-                                    | FExternal spec ->
-                                        // Build/start returning handle (non-blocking) is not expected here
-                                        // Because we rely on start returning a handle via FSync route.
-                                        let h = spec.Build env
-                                        let ah = h.Start()
-                                        // BLOCKING semantics for FExternal in Direct path remain, but
-                                        // for correctness we attempt to await. If this is reached it's a fallback.
-                                        match ah.Await() with
-                                        | AsyncDone (ValueSome v) -> v
-                                        | AsyncFailed (ValueSome ex) -> raise ex
-                                        | AsyncCancelled (ValueSome oce) -> raise oce
-                                        | _ -> failwith "Unexpected pending external in forkSingle fallback path."
-                                    | FDelay th -> run env ct (th())
-                                    | FTryWith (body, handler) ->
-                                        try run env ct body
-                                        with ex -> run env ct (handler ex)
-                                    | FTryFinally (body, fin) ->
-                                        try
-                                            let r = run env ct body
-                                            fin()
-                                            r
-                                        with _ ->
-                                            fin()
-                                            reraise()
-                                let handle = run execEnv CancellationToken.None flowHandle.Program
-                                state <- Running (envIn, handle, execEnv.NowUnix())
+                            // Direct.run variant (simplified) – in Direct path binds are sync
+                            let rec run env ct prog =
+                                match prog with
+                                | FPure th -> th()
+                                | FSync f -> f env
+                                | FExternal spec ->
+                                    // Build/start returning handle (non-blocking) is not expected here
+                                    // Because we rely on start returning a handle via FSync route.
+                                    let h = spec.Build env
+                                    let ah = h.Start()
+                                    // BLOCKING semantics for FExternal in Direct path remain, but
+                                    // for correctness we attempt to await. If this is reached it's a fallback.
+                                    match ah.Await() with
+                                    | AsyncDone (ValueSome v) -> v
+                                    | AsyncFailed (ValueSome ex) -> raise ex
+                                    | AsyncCancelled (ValueSome oce) -> raise oce
+                                    | _ -> failwith "Unexpected pending external in forkSingle fallback path."
+                                | FDelay th -> run env ct (th())
+                                | FTryWith (body, handler) ->
+                                    try run env ct body
+                                    with ex -> run env ct (handler ex)
+                                | FTryFinally (body, fin) ->
+                                    try
+                                        let r = run env ct body
+                                        fin()
+                                        r
+                                    with _ ->
+                                        fin()
+                                        reraise()
+                            let handle = run execEnv CancellationToken.None flowHandle.Program
+                            state <- Running (envIn, handle, execEnv.NowUnix())
                             Consume
                         | Running (orig, handle, startedAt) ->
                             let res = handle.Poll()
@@ -650,13 +665,14 @@ module Direct =
                             | AsyncDone (ValueSome value) ->
                                 let latencyMs = execEnv.NowUnix() - startedAt
                                 let outPayload = project orig value
+                                let baseEnv = mapPayload outPayload orig
                                 let outEnv =
-                                    { orig with
-                                        Payload = outPayload
+                                    { baseEnv with
                                         Attrs =
-                                            orig.Attrs
+                                            baseEnv.Attrs
                                             |> HashMap.add "fork.latencyMs" (AttrInt64 latencyMs)
-                                            |> HashMap.add "fork.effectId" (AttrObj handle.Token) }
+                                            |> HashMap.add "fork.effectId" (AttrObj (handle.Token :> obj)) 
+                                    }
                                 state <- Idle
                                 Emit outEnv
                             | AsyncFailed (ValueSome ex) ->
@@ -677,10 +693,10 @@ module Direct =
                                 let ex = OperationCanceledException()
                                 state <- Faulted ex
                                 Error ex
-                        | Emitting _ ->
+                        (* | Emitting _ ->
                             // Transitional state not currently used – treat as Complete
                             state <- Idle
-                            Complete
+                            Complete *)
                         | Faulted ex ->
                             // After surfacing an error once, keep returning Error to signal terminal state
                             Error ex
@@ -688,7 +704,7 @@ module Direct =
                 })
 
         /// Convenience version that maps result directly (project only value)
-        let forkSingleValue
+        let forkSingleValue<'In, 'Eff, 'Out>
             (start : 'In -> Flow<EffectHandle<'Eff>>)
             (mapResult : 'Eff -> 'Out)
             : StreamProcessor<'In,'Out> =
