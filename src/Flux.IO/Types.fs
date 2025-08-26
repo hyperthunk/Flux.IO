@@ -31,13 +31,24 @@ type Cost =
         CpuHint: float
     }
 
+type Attribute =
+    | AttrString of string
+    | AttrInt64 of int64
+    | AttrUInt64 of uint64
+    | AttrInt32 of int32
+    | AttrUInt32 of uint32
+    | AttrFloat of float
+    | AttrBool of bool
+    | AttrList of Attribute list
+    | AttrObj of obj
+
 type Envelope<'T> = { 
     Payload : 'T
     Headers : HashMap<string,string>
     SeqId   : int64
     SpanCtx : TraceContext
     Ts      : Timestamp
-    Attrs   : HashMap<string,obj>
+    Attrs   : HashMap<string, Attribute>
     Cost    : Cost
 } with 
     static member create<'T> seqId (payload: 'T) =
@@ -68,13 +79,14 @@ type Envelope<'T> = {
                 Headers = f env.Headers
         }
 
-type Batch<'T> = {
-    Items: Envelope<'T> array
-    WindowStart: Timestamp
-    WindowEnd: Timestamp
-    TotalBytes: int
-    TotalItems: int
-}
+type Batch<'T> = 
+    {
+        Items: Envelope<'T> array
+        WindowStart: Timestamp
+        WindowEnd: Timestamp
+        TotalBytes: int
+        TotalItems: int
+    }
 
 type StageKind =
     | Source
@@ -90,17 +102,17 @@ type EffectClass =
     | EffectTimer
     | EffectExternal of string
 
-type AsyncToken<'a> = internal AsyncToken of obj
+type BackendToken<'a> = internal BackendToken of obj
 
 [<Struct>]
-type AsyncResult<'a> =
+type EffectResult<'a> =
     | AsyncDone      of result: 'a voption
     | AsyncFailed    of reason: exn voption
     | AsyncCancelled of reason: exn voption
     | AsyncPending
 
 [<AbstractClass>]
-type AsyncHandle<'a>(internal token: AsyncToken<'a>) =
+type EffectHandle<'a>(internal token: BackendToken<'a>) =
     member __.Token = token
 
     /// Check if the async operation is completed
@@ -109,31 +121,31 @@ type AsyncHandle<'a>(internal token: AsyncToken<'a>) =
     // NB: this would be a lot cleaner with higher kinded types...
     // abstract member AsTokenSource<'t> : unit -> 't option
 
-    abstract member Poll: unit -> AsyncResult<'a>
+    abstract member Poll: unit -> EffectResult<'a>
 
     /// Await the completion of the async operation (blocks the caller)
-    abstract member Await : unit -> AsyncResult<'a>             // Blocking await
+    abstract member Await : unit -> EffectResult<'a>             // Blocking await
     
     /// Await with a timeout
-    abstract member AwaitTimeout : TimeSpan -> AsyncResult<'a> // Blocking await with timeout
+    abstract member AwaitTimeout : TimeSpan -> EffectResult<'a> // Blocking await with timeout
     
     /// Cancel the async operation - returns immediately
     abstract member Cancel : unit -> unit
 
-    abstract member CancelWait : unit -> AsyncResult<'a> // Cancel the async operation and wait for completion
+    abstract member CancelWait : unit -> EffectResult<'a> // Cancel the async operation and wait for completion
 
-    abstract member CancelWaitTimeout : TimeSpan -> AsyncResult<'a> // Cancel and wait with timeout
+    abstract member CancelWaitTimeout : TimeSpan -> EffectResult<'a> // Cancel and wait with timeout
 
-type AsyncState<'T> =
+type EffectState<'T> =
     | NotStarted
     | Running of CancellationTokenSource
-    | Completed of AsyncResult<'T>
+    | Completed of EffectResult<'T>
 
 type AsyncMessage<'T> =
-    | Start of AsyncReplyChannel<AsyncHandle<'T>>
-    | Query of AsyncReplyChannel<AsyncState<'T>>
-    | SetResult of AsyncResult<'T>
-    | WaitForResult of TimeSpan option * AsyncReplyChannel<AsyncResult<'T>>
+    | Start of AsyncReplyChannel<EffectHandle<'T>>
+    | Query of AsyncReplyChannel<EffectState<'T>>
+    | SetResult of EffectResult<'T>
+    | WaitForResult of TimeSpan option * AsyncReplyChannel<EffectResult<'T>>
 
 (* 
     Typed external (impure) operation handle.
@@ -148,7 +160,7 @@ type ExternalHandle<'T> =
     abstract member Class       : EffectClass
     abstract member IsStarted   : bool
     abstract member IsCompleted : bool
-    abstract member Start       : unit -> AsyncHandle<'T>
+    abstract member Start       : unit -> EffectHandle<'T>
 
 type IMetrics =
     abstract RecordCounter: name: string * tags: HashMap<string,string> * value: int64 -> unit

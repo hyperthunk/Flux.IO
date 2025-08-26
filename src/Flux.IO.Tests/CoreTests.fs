@@ -326,11 +326,11 @@ module CoreTests =
 
         test "Envelope Creation with Custom Attributes" {
             let envelope = Envelope<_>.create 2 "test payload 2"
-            let attrs = FastMap.ofSeq [("key1", box "value1"); ("key2", box 42)]
+            let attrs = FastMap.ofSeq [("key1", AttrString "value1"); ("key2", AttrInt32 42)]
             let envelopeWithAttrs = { envelope with Attrs = attrs }
             Expect.equal (HashMap.count envelopeWithAttrs.Attrs) 2 "Attrs should have 2 items"
-            Expect.equal (FastMap.find "key1" envelopeWithAttrs.Attrs) (box "value1") "Attr 'key1' should match"
-            Expect.equal (FastMap.find "key2" envelopeWithAttrs.Attrs) (box 42) "Attr 'key2' should match"
+            Expect.equal (FastMap.find "key1" envelopeWithAttrs.Attrs) (AttrString "value1") "Attr 'key1' should match"
+            Expect.equal (FastMap.find "key2" envelopeWithAttrs.Attrs) (AttrInt32 42) "Attr 'key2' should match"
         }
     ]
 

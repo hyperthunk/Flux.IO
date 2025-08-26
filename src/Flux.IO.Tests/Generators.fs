@@ -122,7 +122,7 @@ module Generators =
                     let! keys = 
                         Gen.elements ["a"; "b"; "c"; "payload"; "seq"] |> Gen.listOfLength n
                     let! vals = 
-                        Gen.elements [ box 1; box "v"; box 42; box true; box 0.5 ] |> Gen.listOfLength n
+                        Gen.elements [ AttrInt32 1; AttrString "v"; AttrInt32 42; AttrBool true; AttrFloat 0.5 ] |> Gen.listOfLength n
                     let pairs = List.zip keys vals
                     return pairs |> List.fold (fun acc (k,v) -> HashMap.add k v acc) HashMap.empty
                 }

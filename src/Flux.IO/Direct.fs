@@ -333,8 +333,8 @@ module Direct =
                                     task <- factory()
                                     started.Set()
                                 
-                                let token = AsyncToken task
-                                { new AsyncHandle<'T>(token) with
+                                let token = BackendToken task
+                                { new EffectHandle<'T>(token) with
                                     member _.IsCompleted = task.IsCompleted
                                     
                                     member _.Poll() =
@@ -401,7 +401,7 @@ module Direct =
                                 started.Set()
                             
                             // Return handle to the RUNNING task
-                            { new AsyncHandle<'T>(AsyncToken task) with
+                            { new EffectHandle<'T>(BackendToken task) with
                                 member _.IsCompleted = task.IsCompleted
                                 
                                 member _.Poll() =
@@ -453,13 +453,254 @@ module Direct =
             }
             externalSpec spec
 
+        // Start (build + start) an ExternalSpec returning the raw EffectHandle<'T> without awaiting completion.
+        // This is synchronous and allocation-light: it executes only the builder and Start().
+        let effectHandle (spec: ExternalSpec<'T>) : Flow<EffectHandle<'T>> =
+            { Program =
+                FSync (fun env ->
+                    let h = spec.Build env
+                    if h.IsStarted then invalidOp "External effect already started."
+                    let handle = h.Start() // side effect: effect starts
+                    // NOTE: ExternalHandle 'h' is not disposed automatically here.
+                    // TODO: Consider wrapping handle to dispose 'h' after completion (Phase 2).
+                    handle
+                )
+            }
+
+        // Non-blocking start for a Task-producing factory; returns an EffectHandle.
+        let taskHandle (factory: unit -> Task<'T>) : Flow<EffectHandle<'T>> =
+            // Reuse existing Task adapter spec then return the handle
+            let specFlow = task factory
+            // 'task' currently blocks (awaits). We need a fresh spec that does NOT block.
+            // Provide a minimal spec replicating the logic but returning handle directly.
+            let spec =
+                {
+                    Build = fun _ ->
+                        let mutable taskRef : Task<'T> = Unchecked.defaultof<_>
+                        let started = new ManualResetEventSlim(false)
+                        { new ExternalHandle<'T> with
+                            member _.Id = 123 // TODO: FIXME
+                            member _.Class = EffectExternal "System.Threading.Tasks.Task"
+                            member _.IsStarted = started.IsSet
+                            member _.IsCompleted = started.IsSet && not (isNull taskRef) && taskRef.IsCompleted
+                            member _.Start() =
+                                if not started.IsSet then
+                                    taskRef <- factory()
+                                    started.Set()
+                                { new EffectHandle<'T>(BackendToken taskRef) with
+                                    member _.IsCompleted = taskRef.IsCompleted
+                                    member _.Poll() =
+                                        if taskRef.IsCompletedSuccessfully then AsyncDone (ValueSome taskRef.Result)
+                                        elif taskRef.IsFaulted then
+                                            let ex =
+                                                match taskRef.Exception with
+                                                | null -> null
+                                                | ae when isNull ae.InnerException -> ae :> exn
+                                                | ae -> ae.InnerException
+                                            if isNull ex then AsyncFailed ValueNone
+                                            else AsyncFailed (ValueSome ex)
+                                        elif taskRef.IsCanceled then AsyncCancelled ValueNone
+                                        else AsyncPending
+                                    member this.Await() =
+                                        taskRef.Wait()
+                                        this.Poll()
+                                    member this.AwaitTimeout ts =
+                                        if taskRef.Wait ts then this.Poll() else AsyncPending
+                                    member _.Cancel() = ()
+                                    member this.CancelWait() = this.Await()
+                                    member this.CancelWaitTimeout ts = this.AwaitTimeout ts
+                                }
+                            member _.Dispose() =
+                                started.Dispose()
+                                if not (isNull taskRef) then taskRef.Dispose()
+                        }
+                    Classify = EffectExternal "Task"
+                    DebugLabel = Some "task-handle"
+                }
+            effectHandle spec
+
+        // Non-blocking start for Async<'T>; returns an EffectHandle<'T>.
+        let asyncHandle (comp: Async<'T>) : Flow<EffectHandle<'T>> =
+            let spec =
+                {
+                    Build = fun env ->
+                        // Delegate to existing async adapter but intercept before blocking
+                        let cts = new CancellationTokenSource()
+                        let mutable taskRef : Task<'T> = Unchecked.defaultof<_>
+                        let started = new ManualResetEventSlim(false)
+                        { new ExternalHandle<'T> with
+                            member _.Id = 123 // TODO: FIXME
+                            member _.Class = EffectExternal "FSharp.Async"
+                            member _.IsStarted = started.IsSet
+                            member _.IsCompleted = started.IsSet && not (isNull taskRef) && taskRef.IsCompleted
+                            member _.Start() =
+                                if not started.IsSet then
+                                    taskRef <- Async.StartAsTask(comp, cancellationToken = cts.Token)
+                                    started.Set()
+                                { new EffectHandle<'T>(BackendToken taskRef) with
+                                    member _.IsCompleted = taskRef.IsCompleted
+                                    member _.Poll() =
+                                        if taskRef.IsCompletedSuccessfully then AsyncDone (ValueSome taskRef.Result)
+                                        elif taskRef.IsFaulted then
+                                            let ex =
+                                                match taskRef.Exception with
+                                                | null -> null
+                                                | ae when isNull ae.InnerException -> ae :> exn
+                                                | ae -> ae.InnerException
+                                            if isNull ex then AsyncFailed ValueNone
+                                            else AsyncFailed (ValueSome ex)
+                                        elif taskRef.IsCanceled then AsyncCancelled ValueNone
+                                        else AsyncPending
+                                    member this.Await() =
+                                        taskRef.Wait()
+                                        this.Poll()
+                                    member this.AwaitTimeout ts =
+                                        if taskRef.Wait ts then this.Poll() else AsyncPending
+                                    member _.Cancel() = cts.Cancel()
+                                    member this.CancelWait() =
+                                        cts.Cancel()
+                                        this.Await()
+                                    member this.CancelWaitTimeout ts =
+                                        cts.Cancel()
+                                        this.AwaitTimeout ts
+                                }
+                            member _.Dispose() =
+                                started.Dispose()
+                                cts.Dispose()
+                                if not (isNull taskRef) then taskRef.Dispose()
+                        }
+                    Classify = EffectExternal "Async"
+                    DebugLabel = Some "async-handle"
+                }
+            effectHandle spec
+
+    // Intermediary module: offload + later emission (Phase 1)
+    module Intermediary =
+
+        open FSharp.HashCollections
+        open Flux.IO.Core.Types
+
+        /// Internal state for a single in-flight offloaded effect.
+        type private SingleForkState<'In,'Eff,'Out> =
+            | Idle
+            | Running of original: Envelope<'In> * handle: EffectHandle<'Eff> * startedAt: int64
+            | Emitting of Envelope<'Out>
+            | Faulted of exn
+
+        /// Offload one effect per input envelope, emit result later.
+        /// Behaviour:
+        ///  - On first receipt with Idle, start effect handle -> return Consume.
+        ///  - Subsequent calls (poll/tick) while Running:
+        ///       * Poll() pending -> Consume
+        ///       * Poll() done    -> Emit mapped result
+        ///       * Failure        -> Error
+        ///  - After emission, state resets to Idle (allowing reuse for next envelope).
+        /// NOTE: For now, no queuing of multiple inputs; if a new envelope arrives while
+        ///       Running, it is ignored with Consume (could be extended).
+        let forkSingle
+            (start   : 'In -> Flow<EffectHandle<'Eff>>)
+            (project : Envelope<'In> -> 'Eff -> 'Out)
+            : StreamProcessor<'In,'Out> =
+            let mutable state : SingleForkState<'In,'Eff,'Out> = Idle
+            StreamProcessor (fun (envIn: Envelope<'In>) ->
+                { Program =
+                    FSync (fun execEnv ->
+                        match state with
+                        | Idle ->
+                            // Start new effect for this envelope
+                            let flowHandle = start envIn.Payload
+                            let handleVT =
+                                // Direct.run variant (simplified) – in Direct path binds are sync
+                                let rec run env ct prog =
+                                    match prog with
+                                    | FPure th -> th()
+                                    | FSync f -> f env
+                                    | FExternal spec ->
+                                        // Build/start returning handle (non-blocking) is not expected here
+                                        // Because we rely on start returning a handle via FSync route.
+                                        let h = spec.Build env
+                                        let ah = h.Start()
+                                        // BLOCKING semantics for FExternal in Direct path remain, but
+                                        // for correctness we attempt to await. If this is reached it's a fallback.
+                                        match ah.Await() with
+                                        | AsyncDone (ValueSome v) -> v
+                                        | AsyncFailed (ValueSome ex) -> raise ex
+                                        | AsyncCancelled (ValueSome oce) -> raise oce
+                                        | _ -> failwith "Unexpected pending external in forkSingle fallback path."
+                                    | FDelay th -> run env ct (th())
+                                    | FTryWith (body, handler) ->
+                                        try run env ct body
+                                        with ex -> run env ct (handler ex)
+                                    | FTryFinally (body, fin) ->
+                                        try
+                                            let r = run env ct body
+                                            fin()
+                                            r
+                                        with _ ->
+                                            fin()
+                                            reraise()
+                                let handle = run execEnv CancellationToken.None flowHandle.Program
+                                state <- Running (envIn, handle, execEnv.NowUnix())
+                            Consume
+                        | Running (orig, handle, startedAt) ->
+                            let res = handle.Poll()
+                            match res with
+                            | AsyncPending ->
+                                Consume
+                            | AsyncDone (ValueSome value) ->
+                                let latencyMs = execEnv.NowUnix() - startedAt
+                                let outPayload = project orig value
+                                let outEnv =
+                                    { orig with
+                                        Payload = outPayload
+                                        Attrs =
+                                            orig.Attrs
+                                            |> HashMap.add "fork.latencyMs" (AttrInt64 latencyMs)
+                                            |> HashMap.add "fork.effectId" (AttrObj handle.Token) }
+                                state <- Idle
+                                Emit outEnv
+                            | AsyncFailed (ValueSome ex) ->
+                                state <- Faulted ex
+                                Error ex
+                            | AsyncCancelled (ValueSome oce) ->
+                                state <- Faulted oce
+                                Error oce
+                            | AsyncDone ValueNone ->
+                                // Consider treating as protocol error
+                                state <- Faulted (InvalidOperationException "Effect completed without value.")
+                                Error (InvalidOperationException "Empty effect result")
+                            | AsyncFailed ValueNone ->
+                                let ex = InvalidOperationException "Unknown effect failure"
+                                state <- Faulted ex
+                                Error ex
+                            | AsyncCancelled ValueNone ->
+                                let ex = OperationCanceledException()
+                                state <- Faulted ex
+                                Error ex
+                        | Emitting _ ->
+                            // Transitional state not currently used – treat as Complete
+                            state <- Idle
+                            Complete
+                        | Faulted ex ->
+                            // After surfacing an error once, keep returning Error to signal terminal state
+                            Error ex
+                    )
+                })
+
+        /// Convenience version that maps result directly (project only value)
+        let forkSingleValue
+            (start : 'In -> Flow<EffectHandle<'Eff>>)
+            (mapResult : 'Eff -> 'Out)
+            : StreamProcessor<'In,'Out> =
+            forkSingle start (fun _ v -> mapResult v)
+
     module MBox =
             
         type private AsyncMessage<'T> =
             | Start of AsyncReplyChannel<unit>
-            | Poll of AsyncReplyChannel<AsyncResult<'T>>
-            | Wait of AsyncReplyChannel<AsyncResult<'T>>
-            | WaitTimeout of TimeSpan * AsyncReplyChannel<AsyncResult<'T>>
+            | Poll of AsyncReplyChannel<EffectResult<'T>>
+            | Wait of AsyncReplyChannel<EffectResult<'T>>
+            | WaitTimeout of TimeSpan * AsyncReplyChannel<EffectResult<'T>>
             | Cancel
         
         let lift (comp: Async<'T>) : Flow<'T> =
@@ -541,9 +782,9 @@ module Direct =
                             
                             notStarted()
                         )
-                        
-                        let createHandle() : AsyncHandle<'T> =
-                            { new AsyncHandle<'T>(AsyncToken agent) with
+
+                        let createHandle() : EffectHandle<'T> =
+                            { new EffectHandle<'T>(BackendToken agent) with
                                 member _.IsCompleted = completed.IsSet
                                 member _.Poll() = agent.PostAndReply Poll
                                 member _.Await() = agent.PostAndReply Wait
@@ -581,9 +822,9 @@ module Direct =
         
         // Represents a already started async operation that can be checked multiple times
         type StartedAsync<'T> = {
-            Poll: unit -> AsyncResult<'T>          // Non-blocking check
-            Await: unit -> AsyncResult<'T>         // Blocking wait
-            AwaitTimeout: TimeSpan -> AsyncResult<'T>  // Blocking wait with timeout
+            Poll: unit -> EffectResult<'T>          // Non-blocking check
+            Await: unit -> EffectResult<'T>         // Blocking wait
+            AwaitTimeout: TimeSpan -> EffectResult<'T>  // Blocking wait with timeout
             Cancel: unit -> unit
             IsCompleted: unit -> bool
         }
