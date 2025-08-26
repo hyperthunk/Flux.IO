@@ -1011,7 +1011,11 @@ module Direct =
 
     module StreamProcessor =
 
-        let ask : Flow<ExecutionEnv> = sync id
+        let ask : Flow<ExecutionEnv> = 
+            flow {
+                let! env = sync id
+                return env
+            }
 
         // Access execution environment
         let withEnv (f: ExecutionEnv -> 'a -> Flow<'b>) : StreamProcessor<'a, 'b> =

@@ -151,8 +151,11 @@ module CoreTests =
 
             testCase "ask returns exact environment instance" <| fun () ->
                 let env,_,_,_ = TestEnv.mkEnv()
-                let got = run env (* CancellationToken.None *) StreamProcessor.ask
-                Expect.isTrue (Object.ReferenceEquals(env, got.Result)) "Environment identity must match"
+                match run env (* CancellationToken.None *) StreamProcessor.ask with
+                | EffectDone (ValueSome got) ->
+                    printfn "Got environment: %A" got
+                    Expect.isTrue (Object.ReferenceEquals(env, got)) "Environment identity must match"
+                | _ -> failtestf "Expected Execution Environment in run output"
 
             // TODO: FIXME - reintroduce or refactor local
             (* testCase "local modifies environment for enclosed computation only" <| fun () ->
