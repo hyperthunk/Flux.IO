@@ -193,16 +193,16 @@ type StreamCommand<'T> =
     | Complete
     | Error of exn
 
-// --------------------------------------------------------------------------------------
-// Direct Flow Program Representation
-// --------------------------------------------------------------------------------------
-// We keep a lightweight representation. Instead of baking a full Freer tree we rely on
-// the interpreter's continuation chaining. Only external boundaries are explicit nodes.
-//
-// FlowProg<'T> forms a *minimal structural* IR with NO existential storage. Each bind
-// composes into a single final executable function in Flow<'T>. This keeps runtime
-// overhead low, but sacrifices full introspection of intermediate binds.
-// --------------------------------------------------------------------------------------
+(* 
+    Direct Flow Program Representation
+
+    We keep a lightweight representation. Instead of baking a full Freer tree we rely on
+    the interpreter's continuation chaining. Only external boundaries are explicit nodes.
+
+    FlowProg<'T> forms a *minimal structural* IR with NO existential storage. Each bind
+    composes into a single final executable function in Flow<'T>. This keeps runtime
+    overhead low, but sacrifices full introspection of intermediate binds. 
+*)
 type FlowProg<'T> =
     | FPure    of (unit -> 'T)                      // Lazy pure value
     | FSync    of (ExecutionEnv -> 'T)              // Synchronous function of env
@@ -211,7 +211,7 @@ type FlowProg<'T> =
     | FTryWith of FlowProg<'T> * (exn -> FlowProg<'T>)
     | FTryFinally of FlowProg<'T> * (unit -> unit)
 
-/// The public Flow wrapper (kept opaque to allow internal evolution).
+// Flow wrapper (kept opaque to allow internal evolution).
 type Flow<'T> = 
     { 
         Program: FlowProg<'T> 

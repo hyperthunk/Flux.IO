@@ -6,6 +6,10 @@ module Direct =
     open System.Threading
     open System.Threading.Tasks
 
+    // Sentinel to kickoff an interpreter-driven bind chain.
+    // We throw this from a private FSync node and catch it in the interpreter.
+    exception private RunBindEx of obj
+
     let inline ofProg p : Flow<'T> = { Program = p }
 
     let inline pure' (x: 'T) : Flow<'T> =
@@ -28,55 +32,38 @@ module Direct =
     let inline tryFinally (m: Flow<'T>) (fin: unit -> unit) : Flow<'T> =
         { Program = FTryFinally (m.Program, fin) }
 
-    
-    (*
-        Note: Single-step, flattening Interpreter primitive 
+    // -----------------------------------------------------------------------------
+    // Direct Interpreter for FlowProg<'T>
+    // -----------------------------------------------------------------------------
 
-        Evaluating `runExternal` has runProg evaluate a FlowProg<'T> into a ValueTask<'T>. 
-        External effects are executed by obtaining an ExternalHandle<'T> and polling/waiting 
-        (currently this is a naive blocking loop).
-        
-        Integration with scheduler or event loop is TODO/FIXME.
-    *)
-    
-    
+    // Run a single external operation. This currently blocks the calling thread while
+    // waiting for completion. Later this can be replaced with a non-blocking scheduler.
     let private runExternal 
             (env: ExecutionEnv) 
             (ct: CancellationToken) 
             (spec: ExternalSpec<'T>) : ValueTask<'T> =
-        // TODO: Non-blocking integration with scheduler / registration
-        // TODO: Timeout / cancellation bridging
-        // TODO: Backpressure gating before start
         task {
             use handle = spec.Build env
-
-            // Always call Start once to obtain an AsyncHandle for this effect instance
             let asyncHandle = handle.Start()
-            
-            // Bridge cancellation
-            use _reg = ct.Register(fun () ->
-                try asyncHandle.Cancel()
-                with _ -> ()
-            )
-            
-            // Block the current thread waiting for the outcome (direct path)
-            let result =
-                try asyncHandle.Await()
-                with ex ->
-                    // Await should not throw; normalize to AsyncFailed
-                    AsyncFailed (ValueSome ex)
 
-            match result with
-            | AsyncDone (ValueSome v) -> 
-                return v
-            | AsyncDone ValueNone -> 
+            use _reg = ct.Register(fun () ->
+                try asyncHandle.Cancel() with _ -> ())
+
+            // Await the external handle and normalize results to exceptions or value
+            let res =
+                try asyncHandle.Await()
+                with ex -> AsyncFailed (ValueSome ex)
+
+            match res with
+            | AsyncDone (ValueSome value) ->
+                return value
+            | AsyncDone ValueNone ->
                 return raise (InvalidOperationException "External completed with no value")
-            | AsyncFailed (ValueSome ex) -> 
+            | AsyncFailed (ValueSome ex) ->
                 return raise ex
-            | AsyncFailed ValueNone -> 
+            | AsyncFailed ValueNone ->
                 return raise (Exception "Unknown external failure")
             | AsyncCancelled (ValueSome oce) ->
-                // Prefer preserving the provided OCE, but ensure token is visible
                 if ct.IsCancellationRequested then
                     return raise (OperationCanceledException("Operation cancelled", oce, ct))
                 else
@@ -84,10 +71,12 @@ module Direct =
             | AsyncCancelled ValueNone ->
                 return raise (OperationCanceledException(ct))
             | AsyncPending ->
-                // Should not happen after Await()
                 return raise (InvalidOperationException "Await returned Pending")
         } |> ValueTask<'T>
 
+    // The core interpreter. It executes the structural IR and returns a ValueTask<'T>.
+    // It also recognizes the RunBindEx sentinel thrown from our bind wrapper to interpret
+    // a composed sequence without "baking" the composition into the IR.
     let rec private execute 
             (env: ExecutionEnv) 
             (ct: CancellationToken) 
@@ -99,15 +88,28 @@ module Direct =
             | FPure th ->
                 try ValueTask<'T>(th())
                 with ex -> ValueTask<'T>(Task.FromException<'T> ex)
+
             | FSync f ->
-                try ValueTask<'T>(f env)
-                with ex -> ValueTask<'T>(Task.FromException<'T> ex)
+                // Normal sync function (fast path), but allow a sentinel kick-off for bind.
+                try
+                    let r = f env
+                    ValueTask<'T>(r)
+                with
+                | RunBindEx o ->
+                    // Unbox the interpreter thunk and run it
+                    let thunk = unbox<(ExecutionEnv * CancellationToken -> ValueTask<'T>)> o
+                    thunk (env, ct)
+                | ex ->
+                    ValueTask<'T>(Task.FromException<'T> ex)
+
             | FExternal spec ->
                 runExternal env ct spec
+
             | FDelay thunk ->
-                // Do not evaluate thunk early; just proceed when executed
+                // Evaluate the delayed program and continue
                 try execute env ct (thunk())
                 with ex -> ValueTask<'T>(Task.FromException<'T> ex)
+
             | FTryWith (body, handler) ->
                 let vt = execute env ct body
                 if vt.IsCompletedSuccessfully then
@@ -119,12 +121,12 @@ module Direct =
                         with ex ->
                             let hProg =
                                 try handler ex
-                                with hex -> 
-                                    // escalate
-                                    FTryWith(FPure(fun () -> raise hex), 
+                                with hex ->
+                                    FTryWith(FPure(fun () -> raise hex),
                                              fun _ -> FPure(fun () -> raise hex))
                             return! execute env ct hProg |> fun v -> v.AsTask()
                     } |> ValueTask<'T>
+
             | FTryFinally (body, fin) ->
                 let vt = execute env ct body
                 if vt.IsCompletedSuccessfully then
@@ -144,29 +146,39 @@ module Direct =
                             return raise ex
                     } |> ValueTask<'T>
 
-    (*
-        Execute a Flow<'T>. Because bind currently flattens sequencing by performing
-        synchronous waits (blocking), run simply executes the program tree.
-        
-        NOTE: When you later move to a structural bind or managed scheduler, run can
-        become non-blocking and integrate with a poller/event loop.
-    *)
-    let run (env: ExecutionEnv) (ct: CancellationToken) (m: Flow<'T>) : ValueTask<'T> =
-        execute env ct m.Program
+    // -----------------------------------------------------------------------------
+    // Monadic Operations implemented over the interpreter (no blocking shortcut)
+    // -----------------------------------------------------------------------------
 
-    (* Monadic Operations (temporary, blocking sequencing for composition) *)
-    
+    // Sequencing via interpreter. We do NOT block; we compose ValueTasks using the interpreter,
+    // initiated through a sentinel FSync node so that the "phantom" shape remains intact.
+    let private runBind<'A,'B>
+            (env: ExecutionEnv)
+            (ct: CancellationToken)
+            (m: Flow<'A>)
+            (k: 'A -> Flow<'B>) : ValueTask<'B> =
+        let vtA = execute env ct m.Program
+        if vtA.IsCompletedSuccessfully then
+            let a =
+                try vtA.Result
+                with ex -> return ValueTask<'B>(Task.FromException<'B> ex)
+            execute env ct (k a).Program
+        else
+            task {
+                let! a = vtA
+                return! execute env ct (k a).AsTask()
+            } |> ValueTask<'B>
+
     // Explicit generic ordering: k first, then m, helps solver keep 'A and 'B distinct.
     let inline bind<'A,'B> (k: 'A -> Flow<'B>) (m: Flow<'A>) : Flow<'B> =
-        // For now, we sequence by running m to completion, then k a, both synchronously.
-        // This preserves semantics for pure/sync code and unblocks the law tests.
-        // WARNING: This will block a thread for external/async code paths.
-        { Program = 
-            FSync (fun env ->
-                let a = run env CancellationToken.None m |> fun vt -> vt.Result
-                let b = run env CancellationToken.None (k a) |> fun vt -> vt.Result
-                b)
-        }
+        // We encode a tiny node that, when interpreted, throws a sentinel carrying the
+        // interpreter continuation. This avoids baking blocking logic and keeps the IR minimal.
+        { Program =
+            FDelay (fun () ->
+                FSync (fun _ ->
+                    // Kick off runBind via sentinel; the interpreter will catch and run it.
+                    raise (RunBindEx (box (fun (env: ExecutionEnv, ct: CancellationToken) ->
+                        runBind env ct m k))))) }
 
     // map implemented via bind -> return
     let inline map<'A,'B> (f: 'A -> 'B) (m: Flow<'A>) : Flow<'B> =
@@ -175,10 +187,15 @@ module Direct =
     let inline apply (mf: Flow<'a -> 'b>) (ma: Flow<'a>) : Flow<'b> =
         bind (fun f -> map f ma) mf
 
-    // catch helper: capture exceptions into Result<'T,exn>
-    let catch (m: Flow<'T>) : Flow<Result<'T, exn>> =
-        tryWith (map Ok m) (fun ex -> pure' (Error ex))
+    // -----------------------------------------------------------------------------
+    // Public runner
+    // -----------------------------------------------------------------------------
+    let run (env: ExecutionEnv) (ct: CancellationToken) (m: Flow<'T>) : ValueTask<'T> =
+        execute env ct m.Program
 
+    // -----------------------------------------------------------------------------
+    // Computation Expression Builder
+    // -----------------------------------------------------------------------------
     type FlowBuilder () =
         member _.Return (x: 'T) : Flow<'T> = pure' x
         member _.ReturnFrom (m: Flow<'T>) = m
@@ -242,7 +259,7 @@ module Direct =
 
     module Lift =
 
-        /// Lift a Task<'T> by eagerly wrapping as ExternalSpec (simple adapter).
+        /// Lift a Task<'T> by wrapping as ExternalSpec. Await is normalized to AsyncResult.
         let task(factory: unit -> Task<'T>) : Flow<'T> =
             let spec =
                 { 
@@ -251,11 +268,10 @@ module Direct =
                         let started = new ManualResetEventSlim(false)
                         
                         { new ExternalHandle<'T> with
-                            member _.Id = 123 // factory.GetHashCode()
+                            member _.Id = 123 // TODO: better id
                             member _.Class = EffectExternal "System.Threading.Tasks.Task"
                             member _.IsStarted = started.IsSet
-                            member _.IsCompleted = 
-                                started.IsSet && not (isNull task) && task.IsCompleted
+                            member _.IsCompleted = started.IsSet && not (isNull task) && task.IsCompleted
                             
                             member _.Start() =
                                 if not started.IsSet then
@@ -273,7 +289,7 @@ module Direct =
                                             let ex =
                                                 match task.Exception with
                                                 | null -> null
-                                                | ae when Object.ReferenceEquals(ae.InnerException, null) -> ae :> exn
+                                                | ae when obj.ReferenceEquals(ae.InnerException, null) -> ae :> exn
                                                 | ae -> ae.InnerException
                                             if isNull ex then AsyncFailed ValueNone
                                             else AsyncFailed (ValueSome ex)
@@ -325,7 +341,7 @@ module Direct =
                 }
             externalSpec spec
 
-        /// Lift Async<'T>
+        /// Lift Async<'T> with cancellation bridging. Await is normalized to AsyncResult.
         let async (comp: Async<'T>) : Flow<'T> =
             let spec = { 
                 Build = fun _ ->
@@ -334,18 +350,16 @@ module Direct =
                     let mutable task = Unchecked.defaultof<Task<'T>>
                     
                     { new ExternalHandle<'T> with
-                        member _.Id = 123 // FIXME
+                        member _.Id = 123 // TODO: better id
                         member _.Class = EffectExternal "FSharp.Control.Async"
                         member _.IsStarted = started.IsSet
-                        member _.IsCompleted = 
-                            started.IsSet && not (isNull task) && task.IsCompleted
+                        member _.IsCompleted = started.IsSet && not (isNull task) && task.IsCompleted
                         
                         member _.Start() =
                             if not started.IsSet then
                                 task <- Async.StartAsTask(comp, cancellationToken = cts.Token)
                                 started.Set()
                             
-                            // Return handle to the RUNNING task
                             { new AsyncHandle<'T>(AsyncToken task) with
                                 member _.IsCompleted = task.IsCompleted
                                 
@@ -356,7 +370,7 @@ module Direct =
                                         let ex =
                                             match task.Exception with
                                             | null -> null
-                                            | ae when Object.ReferenceEquals(ae.InnerException, null) -> ae :> exn
+                                            | ae when obj.ReferenceEquals(ae.InnerException, null) -> ae :> exn
                                             | ae -> ae.InnerException
                                         if isNull ex then AsyncFailed ValueNone
                                         else AsyncFailed (ValueSome ex)
@@ -482,14 +496,12 @@ module Direct =
                                     reply.Reply (if completed.IsSet then result else AsyncPending)
                                     return! running()
                                 | Wait reply ->
-                                    // Spawn async to wait
                                     async {
                                         completed.Wait()
                                         reply.Reply result
                                     } |> Async.Start
                                     return! running()
                                 | WaitTimeout (ts, reply) ->
-                                    // Spawn async to wait with timeout
                                     async {
                                         if completed.Wait(ts) then
                                             reply.Reply result
@@ -522,7 +534,7 @@ module Direct =
                             }
                         
                         { new ExternalHandle<'T> with
-                            member _.Id = 123 //FIXME
+                            member _.Id = 123 //TODO
                             member _.Class = EffectExternal "FSharp.Control.Async"
                             member _.IsStarted = started.IsSet
                             member _.IsCompleted = completed.IsSet
@@ -536,17 +548,17 @@ module Direct =
                                 (agent :> IDisposable).Dispose()
                         }
                     Classify = EffectExternal "Async"
-                    DebugLabel = Some "lift-async" 
+                    DebugLabel = Some "lift-async-mbox" 
                 }
             externalSpec spec
     
     module Async =
         
-        // Represents a already started async operation that can be checked multiple times
+        // Represents an already started async operation that can be checked multiple times
         type StartedAsync<'T> = {
-            Poll: unit -> AsyncResult<'T>          // Non-blocking check
-            Await: unit -> AsyncResult<'T>         // Blocking wait
-            AwaitTimeout: TimeSpan -> AsyncResult<'T>  // Blocking wait with timeout
+            Poll: unit -> AsyncResult<'T>
+            Await: unit -> AsyncResult<'T>
+            AwaitTimeout: TimeSpan -> AsyncResult<'T>
             Cancel: unit -> unit
             IsCompleted: unit -> bool
         }
@@ -558,39 +570,25 @@ module Direct =
                 let mutable result = AsyncPending
                 let cts = new CancellationTokenSource()
                 
-                // Start the computation with continuations
                 Async.StartWithContinuations(
                     asyncWork,
                     (fun value -> 
                         result <- AsyncDone (ValueSome value)
-                        completed.Set()
-                    ),
+                        completed.Set()),
                     (fun ex -> 
                         result <- AsyncFailed (ValueSome ex)
-                        completed.Set()
-                    ),
+                        completed.Set()),
                     (fun _ -> 
                         result <- AsyncCancelled ValueNone
-                        completed.Set()
-                    ),
+                        completed.Set()),
                     cts.Token
                 )
                 
                 return {
-                    Poll = fun () -> 
-                        if completed.IsSet then result 
-                        else AsyncPending
-                    
-                    Await = fun () ->
-                        completed.Wait()
-                        result
-                    
-                    AwaitTimeout = fun timeout ->
-                        if completed.Wait(timeout) then result
-                        else AsyncPending
-                    
+                    Poll = fun () -> if completed.IsSet then result else AsyncPending
+                    Await = fun () -> completed.Wait(); result
+                    AwaitTimeout = fun timeout -> if completed.Wait(timeout) then result else AsyncPending
                     Cancel = fun () -> cts.Cancel()
-                    
                     IsCompleted = fun () -> completed.IsSet
                 }
             }
@@ -600,20 +598,12 @@ module Direct =
                 (timeout: TimeSpan) 
                 (asyncWork: Async<'T>) : Flow<Choice<'T, StartedAsync<'T>>> =
             flow {
-                // Start the async work
                 let! started = Lift.async (startAsync asyncWork)
-                
-                // Try to get result within timeout
                 match started.AwaitTimeout timeout with
-                | AsyncDone (ValueSome value) -> 
-                    return Choice1Of2 value
-                | AsyncFailed (ValueSome ex) -> 
-                    return raise ex
-                | AsyncCancelled _ -> 
-                    return raise (OperationCanceledException())
-                | _ -> 
-                    // Timeout - return the handle so caller can check later
-                    return Choice2Of2 started
+                | AsyncDone (ValueSome value) -> return Choice1Of2 value
+                | AsyncFailed (ValueSome ex) -> return raise ex
+                | AsyncCancelled _ -> return raise (OperationCanceledException())
+                | _ -> return Choice2Of2 started
             }
 
         /// Helper to retry a timed-out operation
@@ -622,15 +612,10 @@ module Direct =
                 (started: StartedAsync<'T>) : Async<Choice<'T, StartedAsync<'T>>> =
             async {
                 match started.AwaitTimeout timeout with
-                | AsyncDone (ValueSome value) -> 
-                    return Choice1Of2 value
-                | AsyncFailed (ValueSome ex) -> 
-                    return raise ex
-                | AsyncCancelled _ -> 
-                    return raise (OperationCanceledException())
-                | _ -> 
-                    // Still not ready
-                    return Choice2Of2 started
+                | AsyncDone (ValueSome value) -> return Choice1Of2 value
+                | AsyncFailed (ValueSome ex) -> return raise ex
+                | AsyncCancelled _ -> return raise (OperationCanceledException())
+                | _ -> return Choice2Of2 started
             }
 
         /// Progressive timeout with retries
@@ -642,12 +627,9 @@ module Direct =
                 | [] -> return None
                 | firstTimeout :: remainingTimeouts ->
                     let! result = withTimeout firstTimeout asyncWork
-                    
                     match result with
-                    | Choice1Of2 value -> 
-                        return Some value
+                    | Choice1Of2 value -> return Some value
                     | Choice2Of2 started ->
-                        // Try remaining timeouts
                         let rec tryRemaining timeouts =
                             async {
                                 match timeouts with
@@ -658,7 +640,6 @@ module Direct =
                                     | Choice1Of2 value -> return Some value
                                     | Choice2Of2 _ -> return! tryRemaining rest
                             }
-                        
                         return! Lift.async (tryRemaining remainingTimeouts)
             }
 
@@ -667,14 +648,12 @@ module Direct =
                 (timeout: TimeSpan) 
                 (asyncWorks: Async<'T> list) : Flow<('T option * StartedAsync<'T>) list> =
             flow {
-                // Start all operations
                 let! startedOps = 
                     asyncWorks
                     |> List.map startAsync
                     |> Async.Parallel
                     |> Lift.async
                 
-                // Check each with timeout
                 let! results =
                     startedOps
                     |> Array.map (fun started ->
@@ -682,59 +661,23 @@ module Direct =
                             match started.AwaitTimeout timeout with
                             | AsyncDone (ValueSome value) -> return (Some value, started)
                             | _ -> return (None, started)
-                        }
-                    )
+                        })
                     |> Async.Parallel
                     |> Lift.async
                 
                 return Array.toList results
             }
 
-        // Example usage showing the power of returning StartedAsync
-        let startAsyncTest() = flow {
-            let longRunningWork = async {
-                do! Async.Sleep 5000
-                return "Finally done!"
-            }
-            
-            // Try with 1 second timeout
-            let! firstTry = withTimeout (TimeSpan.FromSeconds 1.) longRunningWork
-            
-            match firstTry with
-            | Choice1Of2 result ->
-                printfn "Got result quickly: %s" result
-                return result
-            | Choice2Of2 started ->
-                printfn "Timed out after 1 second, doing other work..."
-                
-                // Do some other work while waiting
-                do! Lift.async (Async.Sleep 2000)
-                
-                // Check again with 3 second timeout
-                let! secondTry = Lift.async (retryTimeout (TimeSpan.FromSeconds 3.) started)
-                
-                match secondTry with
-                | Choice1Of2 result ->
-                    printfn "Got result on retry: %s" result
-                    return result
-                | Choice2Of2 _ ->
-                    printfn "Still not ready, giving up"
-                    return "Default value"
-        }
-
-        /// Create a Flow that runs async work without blocking, with explicit continuation
+        /// Create a Flow that runs async work then continues (sequentially)
         let fork (asyncWork: Async<'T>) (continuation: 'T -> Flow<'R>) : Flow<'R> =
             flow {
-                // Start the async work
                 let! result = Lift.async asyncWork
-                // Continue with the result
                 return! continuation result
             }
         
-        /// Create a Flow that runs multiple async operations in parallel
+        /// Run async operations in "parallel" (sequentially in Direct; real parallel later)
         let par (asyncWorks: Async<'T> list) : Flow<'T list> =
             flow {
-                // Start all async operations
                 let! tasks = 
                     asyncWorks 
                     |> List.map Lift.async 
@@ -744,24 +687,18 @@ module Direct =
                             let! results = acc
                             let! result = elem
                             return result :: results
-                        }
-                    ) (flow { return [] })
+                        }) (flow { return [] })
                 return List.rev tasks
             }
 
-    (* Provide additional API surface layer for forking, parallel, etc *)
-
+    // Extended CE helpers
     type FlowBuilder with
-        
-        /// Fork async work with continuation (non-blocking)
         member __.Fork(asyncWork: Async<'T>, continuation: 'T -> Flow<'R>) : Flow<'R> =
             Async.fork asyncWork continuation
         
-        /// Run async operations in parallel
         member __.Parallel(asyncWorks: Async<'T> list) : Flow<'T list> =
             Async.par asyncWorks
         
-        // Yield control back to scheduler (useful in loops)
         member __.YieldControl() : Flow<unit> =
             Lift.async (Async.SwitchToThreadPool())
 
@@ -776,8 +713,7 @@ module Direct =
                     let! execEnv = ask
                     let! result = f execEnv env.Payload
                     return Emit (Envelope.map (fun _ -> result) env)
-                }
-            )
+                })
 
         // Monadic bind for stream processors
         let bind 
@@ -789,28 +725,21 @@ module Direct =
                     let! cmd = p env
                     match cmd with
                     | Emit outEnv ->
-                        // outEnv has type Envelope<'b>, which is what we need
                         let (StreamProcessor g) = f outEnv.Payload
                         return! g outEnv
                     | EmitMany envs ->
-                        let results : Envelope<'c> list = []
-                        let ems = 
-                            envs 
-                            |> Seq.fold (fun acc outEnv ->
-                                // Each outEnv has type Envelope<'b>
+                        // NOTE: to preserve laziness we'd stream these; for tests we realize eagerly
+                        let results : Envelope<'c> list =
+                            envs
+                            |> List.collect (fun outEnv ->
                                 let (StreamProcessor g) = f outEnv.Payload
-
-                                // TODO: FIXME - we have to force the processor in order to bind here,
-                                // but does this perhaps break the laziness approach when we're in Freer mode?
-                                let res = g outEnv |> run execEnv CancellationToken.None
-                                match res.Result with
-                                | Emit e -> e :: acc
-                                | EmitMany es -> es @ acc
-                                | _ -> acc
-                            ) results
-                        return EmitMany (ems |> List.ofSeq)
+                                let vt = g outEnv |> run execEnv CancellationToken.None
+                                match vt.Result with
+                                | Emit e -> [e]
+                                | EmitMany es -> es
+                                | _ -> [])
+                        return EmitMany results
                     | Consume -> return Consume
                     | Complete -> return Complete
                     | Error e -> return Error e
-                }
-            )
+                })

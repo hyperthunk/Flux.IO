@@ -6,6 +6,11 @@ module Direct =
     open System.Threading
     open System.Threading.Tasks
 
+    // Ambient state to make the current CancellationToken available to FSync bind sequencing
+    // without changing DU shapes or introducing boxing/sentinels.
+    module Ambient =
+        let __internal_CT = new AsyncLocal<CancellationToken>()
+
     let inline ofProg p : Flow<'T> = { Program = p }
 
     let inline pure' (x: 'T) : Flow<'T> =
@@ -40,7 +45,7 @@ module Direct =
     *)
     
     
-    let private runExternal 
+    let runExternal 
             (env: ExecutionEnv) 
             (ct: CancellationToken) 
             (spec: ExternalSpec<'T>) : ValueTask<'T> =
@@ -90,7 +95,7 @@ module Direct =
                 return raise (InvalidOperationException "Await returned Pending")
         } |> ValueTask<'T>
 
-    let rec private execute 
+    let rec execute 
             (env: ExecutionEnv) 
             (ct: CancellationToken) 
             (prog: FlowProg<'T>) : ValueTask<'T> =
@@ -119,6 +124,7 @@ module Direct =
                         try
                             return! vt.AsTask()
                         with ex ->
+                            // Build the handler program; if handler throws, escalate
                             let hProg =
                                 try handler ex
                                 with hex -> 
@@ -147,8 +153,29 @@ module Direct =
 
     (* Monadic Operations (where no structural bind nodes are stored) *)
     
-    // Explicit generic ordering: k first, then m, helps solver keep 'A and 'B distinct.
+    
+    // Sequencing: run m under the current env/ct, then run k a, all inside a single FSync,
+    // so there is no structural bind node and no boxing/sentinels. This is a blocking
+    // composition by design (Direct path).
+    //
+    // NOTE:
+    //  - Explicit generic ordering: k first, then m, helps solver keep 'A and 'B distinct.
+    //  - Ambient.ct is set by Direct.run at the root; we rely on it here
+    //    so FSync can observe the correct CancellationToken.
+    //  - This preserves referential transparency at the API surface while executing eagerly.
     let inline bind<'A,'B> (k: 'A -> Flow<'B>) (m: Flow<'A>) : Flow<'B> =
+        { Program =
+            FSync (fun env ->
+                let ct = Ambient.__internal_CT.Value
+                let a =
+                    let vt = execute env ct m.Program
+                    if vt.IsCompletedSuccessfully then vt.Result else vt.AsTask().Result
+                let b =
+                    let vt2 = execute env ct (k a).Program
+                    if vt2.IsCompletedSuccessfully then vt2.Result else vt2.AsTask().Result
+                b) }
+    
+    (* let inline bind<'A,'B> (k: 'A -> Flow<'B>) (m: Flow<'A>) : Flow<'B> =
         // We produce a Flow whose execution interprets m then k.
         // This does lose intermediate structural shape (acceptable for "Direct" mode).
         let prog =
@@ -183,7 +210,7 @@ module Direct =
                     // The direct approach here: we just indicate a sentinel; real sequencing in runBind below.
                     // This sentinel is consumed by runBind.
                     Unchecked.defaultof<'B>
-                )) }
+                )) } *)
 
     // map implemented via bind -> return
     let inline map<'A,'B> (f: 'A -> 'B) (m: Flow<'A>) : Flow<'B> =
@@ -197,10 +224,17 @@ module Direct =
         we handle composed cases in a unified run function. 
     *)
     let run (env: ExecutionEnv) (ct: CancellationToken) (m: Flow<'T>) : ValueTask<'T> =
+        // PREVIOUS:
         // Since we used sentinel FPure/FSync scaffolding inside bind, we bypass them by
         // directly chaining at runtime:
         // Simplify: treat FSync sentinel with default value as marker— fallback to real run logic.
-        execute env ct m.Program
+        // CURRENT: set ambient CT for nested FSync/Bind to observe
+        let prev = Ambient.__internal_CT.Value
+        Ambient.__internal_CT.Value <- ct
+        try
+            execute env ct m.Program
+        finally
+            Ambient.__internal_CT.Value <- prev
 
     type FlowBuilder () =
         member _.Return (x: 'T) : Flow<'T> = pure' x
