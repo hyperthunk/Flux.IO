@@ -5,8 +5,10 @@ open System.Text
 open Newtonsoft.Json.Linq
 open FSharp.HashCollections
 open Flux.IO
-open Flux.IO.Core
-open Flux.IO.Core.Flow
+// open Flux.IO.Core1
+// open Flux.IO.Core1.Flow
+open Flux.IO.Core.Types
+open Flux.IO.Pipeline.Direct
 open Generators.JsonGenerators
 
 open IntegrationStages
@@ -116,7 +118,7 @@ module CoreIntegrationPipeline =
         let private runProc<'a,'b> (ctx: ExecContext) (proc: StreamProcessor<'a,'b>) (payload: 'a) =
             let envl = Envelope.create 0L payload
             StreamProcessor.runProcessor proc envl
-            |> Flow.run ctx.Env CancellationToken.None
+            |> run ctx.Env (* CancellationToken.None *)
             |> fun vt -> vt.Result
 
         type DirectRuntimeState =
@@ -132,9 +134,9 @@ module CoreIntegrationPipeline =
         let stepDirect ctx (pl:DirectPipeline) st =
             if not st.SourceDone then
                 match runProc ctx pl.Source () with
-                | Emit eJson ->
+                | Left (Emit eJson) ->
                     match runProc ctx pl.Parser eJson.Payload with
-                    | Emit _ ->
+                    | Left (Emit _) ->
                         st.SourceDone <- true
                         st.Parsed <- true
                         Choice1Of2 "Source+Parse"
@@ -144,15 +146,15 @@ module CoreIntegrationPipeline =
                 | _ -> Choice2Of2 "NoProgress"
             elif st.Parsed && pl.Accum.IsSome && not st.AccumDone then
                 match runProc ctx pl.Accum.Value (JToken.Parse "\"_forward_token_unavailable\"") with
-                | Emit _ -> Choice1Of2 "AccumEvent"
-                | Complete ->
+                | Left (Emit _) -> Choice1Of2 "AccumEvent"
+                | Left Complete ->
                     st.AccumDone <- true
                     Choice1Of2 "AccumComplete"
                 | _ -> Choice2Of2 "AccumConsume"
             elif st.Parsed && pl.Projection.IsSome && not st.Projection1 then
                 match runProc ctx pl.Projection.Value (JToken.Parse "\"_forward_token_unavailable\"") with
-                | Emit _ -> st.Projection1 <- true; Choice1Of2 "Projection1"
-                | Complete -> st.Projection1 <- true; Choice1Of2 "ProjectionCompleteEarly"
+                | Left (Emit _) -> st.Projection1 <- true; Choice1Of2 "Projection1"
+                | Left Complete -> st.Projection1 <- true; Choice1Of2 "ProjectionCompleteEarly"
                 | _ -> Choice2Of2 "ProjectionConsume"
             else
                 Choice2Of2 "Idle"
@@ -169,24 +171,24 @@ module CoreIntegrationPipeline =
         let stepChunk ctx (pl:ChunkPipeline) st =
             if not st.SourceDone then
                 match runProc ctx pl.Source () with
-                | Emit eJson ->
+                | Left (Emit eJson) ->
                     match runProc ctx pl.ToBytes eJson.Payload with
-                    | Emit _ -> st.SourceDone <- true; st.ToBytesRun <- true; Choice1Of2 "Source+ToBytes"
+                    | Left _ -> st.SourceDone <- true; st.ToBytesRun <- true; Choice1Of2 "Source+ToBytes"
                     | _ -> st.SourceDone <- true; Choice1Of2 "SourceOnly"
                 | _ -> Choice2Of2 "NoProgress"
             elif not st.ChunkingDone then
                 match runProc ctx pl.Chunker () with
-                | Emit chunkEnv ->
+                | Left (Emit chunkEnv) ->
                     match runProc ctx pl.Parser chunkEnv.Payload with
-                    | Emit _ ->
+                    | Left (Emit _) ->
                         st.Parsed <- true
                         Choice1Of2 "FinalChunk+Parsed"
-                    | Consume -> Choice1Of2 "MidChunk"
-                    | Complete ->
+                    | Left Consume -> Choice1Of2 "MidChunk"
+                    | Left Complete ->
                         st.ChunkingDone <- true
                         Choice1Of2 "ChunkerCompletePremature"
                     | _ -> Choice2Of2 "UnexpectedCmd"
-                | Complete ->
+                | Left Complete ->
                     st.ChunkingDone <- true
                     Choice1Of2 "ChunkingComplete"
                 | _ -> Choice2Of2 "ChunkConsume"

@@ -56,3 +56,5 @@ nunit-*.xml
 .fake
 /packages
 /coveragereport
+src/main
+src/test

@@ -29,8 +29,10 @@ module IntegrationStages =
     open Newtonsoft.Json.Linq
     open FSharp.HashCollections
     open Flux.IO
-    open Flux.IO.Core
-    open Flux.IO.Core.Flow
+    // open Flux.IO.Core1
+    //open Flux.IO.Core1.Flow
+    open Flux.IO.Core.Types
+    open Flux.IO.Pipeline.Direct
     open Generators.JsonGenerators
 
     /// Domain event produced by the accumulation stage.
@@ -70,7 +72,7 @@ module IntegrationStages =
                 flow {
                     let bytes = Encoding.UTF8.GetBytes env.Payload
                     let rom = ReadOnlyMemory<byte>(bytes)
-                    return Emit (mapEnvelope (fun _ -> rom) env)
+                    return Emit (Envelope.map (fun _ -> rom) env)
                 })
 
     [<RequireQualifiedAccess>]
@@ -122,7 +124,7 @@ module IntegrationStages =
                             let json = Encoding.UTF8.GetString raw
                             let token = JToken.Parse json
                             doneFlag.Value <- true
-                            return Emit (mapEnvelope (fun _ -> token) env)
+                            return Emit (Envelope.map (fun _ -> token) env)
                         else
                             return Consume
                     else
@@ -134,7 +136,7 @@ module IntegrationStages =
             StreamProcessor (fun (env: Envelope<string>) ->
                 flow {
                     let token = JToken.Parse env.Payload
-                    return Emit (mapEnvelope (fun _ -> token) env)
+                    return Emit (Envelope.map (fun _ -> token) env)
                 })
 
     [<RequireQualifiedAccess>]
@@ -152,10 +154,10 @@ module IntegrationStages =
         *)
 
         let create (threshold: int) : StreamProcessor<JToken, AccumEvent> =
-            let working = ref HashMap.empty<string,obj>
-            let seen = ref (HashSet.empty<string>)
-            let doneFlag = ref false
-            let finalDomain = ref (HashSet.empty<string>)
+            let mutable working = HashMap.empty<string,obj>
+            let mutable seen = HashSet.empty<string>
+            let mutable doneFlag = false
+            let mutable finalDomain = HashSet.empty<string>
 
             let captureScalars (root: JToken) =
                 match root with
@@ -171,30 +173,32 @@ module IntegrationStages =
 
             StreamProcessor (fun (env: Envelope<JToken>) ->
                 flow {
-                    if !doneFlag then
+                    if doneFlag then
                         return Complete
                     else
                         let scalars = captureScalars env.Payload
                         // incorporate new keys
                         let mutable batchOut : HashMap<string,obj> option = None
-                        for (k,v) in scalars do
-                            if not (HashSet.contains k !seen) then
-                                seen := HashSet.add k !seen
-                                working := HashMap.add k (box (v.ToString())) !working
-                                if HashMap.count !working >= threshold then
-                                    batchOut <- Some !working
-                                    working := HashMap.empty
+                        scalars
+                        |> List.iter (fun (k,v) ->
+                            if not (HashSet.contains k seen) then
+                                seen <- HashSet.add k seen
+                                working <- HashMap.add k (box (v.ToString())) working
+                                if HashMap.count working >= threshold then
+                                    batchOut <- Some working
+                                    working <- HashMap.empty)
+                        
                         // Determine if all properties discovered
                         let totalScalarCount = scalars |> List.map fst |> Set.ofList |> Set.count
-                        let discoveredCount = HashSet.count !seen
+                        let discoveredCount = HashSet.count seen
                         match batchOut with
                         | Some b ->
-                            return Emit (mapEnvelope (fun _ -> Batch b) env)
+                            return Emit (Envelope.map (fun _ -> Batch b) env)
                         | None when discoveredCount = totalScalarCount ->
-                            doneFlag := true
-                            let domain = !seen
-                            finalDomain := domain
-                            return Emit (mapEnvelope (fun _ -> Done domain) env)
+                            doneFlag <- true
+                            let domain = seen
+                            finalDomain <- domain
+                            return Emit (Envelope.map (fun _ -> Done domain) env)
                         | None ->
                             return Consume
                 })
@@ -218,7 +222,7 @@ module IntegrationStages =
                                     if p.Value :? JObject then None
                                     else Some (p.Name, box (p.Value.ToString())))
                                 |> Seq.fold (fun acc (k,v) -> HashMap.add k v acc) HashMap.empty
-                            return Emit (mapEnvelope (fun _ -> Scalars scalars) env)
+                            return Emit (Envelope.map (fun _ -> Scalars scalars) env)
                         elif not !emittedObjects then
                             emittedObjects := true
                             let objs =
@@ -228,7 +232,7 @@ module IntegrationStages =
                                     | :? JObject as jo -> Some (p.Name, jo.ToString(Newtonsoft.Json.Formatting.None))
                                     | _ -> None)
                                 |> Seq.fold (fun acc (k,v) -> HashMap.add k v acc) HashMap.empty
-                            return Emit (mapEnvelope (fun _ -> Objects objs) env)
+                            return Emit (Envelope.map (fun _ -> Objects objs) env)
                         else
                             return Complete
                     | _ ->
@@ -236,7 +240,7 @@ module IntegrationStages =
                         if not !emittedScalars then
                             emittedScalars := true
                             let map = HashMap.add "value" (box (env.Payload.ToString())) HashMap.empty
-                            return Emit (mapEnvelope (fun _ -> Scalars map) env)
+                            return Emit (Envelope.map (fun _ -> Scalars map) env)
                         else
                             return Complete
                 })

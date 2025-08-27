@@ -31,8 +31,8 @@ open FsCheck
 open FsCheck.Experimental
 open FSharp.HashCollections
 open Flux.IO
-open Flux.IO.Core
-open Flux.IO.Core.Flow
+open Flux.IO.Core1
+open Flux.IO.Core1.Flow
 
 open IntegrationStages
 open CoreIntegrationPipeline

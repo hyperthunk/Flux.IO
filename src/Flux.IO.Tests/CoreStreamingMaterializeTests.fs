@@ -55,7 +55,7 @@ module CoreStreamingMaterializeTests =
 
     [<Tests>]
     let streamingMaterializeProps =
-        ftestList "Streaming Materialize Assembler" [
+        testList "Streaming Materialize Assembler" [
 
             testProperty "streamMaterializeCompletesOnce" <| Prop.forAll genJsonText (fun json ->
                 let chunks = Gen.eval 10 (Random.StdGen (11,97)) (genPartitions json)
