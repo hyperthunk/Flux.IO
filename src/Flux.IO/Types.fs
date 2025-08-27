@@ -215,21 +215,22 @@ type EffectHandle<'a>(internal token: BackendToken<'a>) =
 
     // NB: this would be a lot cleaner with higher kinded types...
     // abstract member AsTokenSource<'t> : unit -> 't option
-
     abstract member Poll: unit -> EffectResult<'a>
 
     /// Await the completion of the async operation (blocks the caller)
-    abstract member Await : unit -> EffectResult<'a>             // Blocking await
+    abstract member Await : unit -> EffectResult<'a>
     
     /// Await with a timeout
-    abstract member AwaitTimeout : TimeSpan -> EffectResult<'a> // Blocking await with timeout
+    abstract member AwaitTimeout : TimeSpan -> EffectResult<'a>
     
     /// Cancel the async operation - returns immediately
     abstract member Cancel : unit -> unit
 
-    abstract member CancelWait : unit -> EffectResult<'a> // Cancel the async operation and wait for completion
+    /// Cancel the async operation and wait for completion
+    abstract member CancelWait : unit -> EffectResult<'a> 
 
-    abstract member CancelWaitTimeout : TimeSpan -> EffectResult<'a> // Cancel and wait with timeout
+    /// Cancel and wait with timeout
+    abstract member CancelWaitTimeout : TimeSpan -> EffectResult<'a> 
 
 type EffectState<'T> =
     | NotStarted
