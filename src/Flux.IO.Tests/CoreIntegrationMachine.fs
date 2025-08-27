@@ -30,13 +30,7 @@ open Newtonsoft.Json.Linq
 open FsCheck
 open FsCheck.Experimental
 open FSharp.HashCollections
-open Flux.IO
-open Flux.IO.Core1
-open Flux.IO.Core1.Flow
-
-open IntegrationStages
 open CoreIntegrationPipeline
-open CoreIntegrationPipeline.PipelineBuilder
 open CoreIntegrationPipeline.PipelineExec
 
 module CoreIntegrationMachine =

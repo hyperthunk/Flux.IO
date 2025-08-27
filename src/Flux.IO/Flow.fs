@@ -1,5 +1,10 @@
 namespace Flux.IO
 
+(*
+    Managed Pipeline API
+
+    NOTE: WORK IN PROGRESS
+*)
 module Core2 = 
 
     open System
