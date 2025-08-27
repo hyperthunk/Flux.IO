@@ -546,6 +546,26 @@ module Direct =
 
     (* Intermediary module: offload + later emission (Phase 1 refactoring) *)
 
+    (*
+        // Example usage pattern:
+
+        let proc =
+            Direct.Intermediary.forkSingle
+                (fun input -> Lift.taskHandle (fun () -> someTaskProducingInt input))
+                (fun env result -> sprintf "Input:%A Result:%d" env.Payload result)
+
+        // Driver loop:
+        let mutable running = true
+        while running do
+            let cmd = StreamProcessor.runProcessor proc inputEnvelope 
+            |> Direct.run env
+            |> fun r -> r.Result
+            match cmd with
+            | Consume -> Thread.Sleep 1
+            | Emit e -> // forward downstream
+            | Complete -> running <- false
+            | Error ex -> failwithf "Stage fault: %A" ex
+    *)
     module Intermediary =
 
         open FSharp.HashCollections
