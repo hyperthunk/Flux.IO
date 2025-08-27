@@ -10,6 +10,7 @@ module TestRunner =
     open Flux.IO.Tests.CoreStreamingInvariantsTests
     open Flux.IO.Tests.CoreStreamingMaterializeTests
     open Flux.IO.Tests.CoreIntegrationTestSuite
+    open Flux.IO.Tests.IntermediaryModelTests
     // open Flux.IO.Tests.CoreStreamProcessingTests
 
     [<EntryPoint>]
@@ -23,6 +24,7 @@ module TestRunner =
             streamingMaterializeProps
             coreIntegrationTests
             coreTests
+            intermediaryTests
             CoreMachine.streamProcessorModelTests
         ]
 

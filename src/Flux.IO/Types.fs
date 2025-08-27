@@ -122,7 +122,7 @@ type EffectClass =
     | EffectTimer
     | EffectExternal of string
 
-type BackendToken<'a> = internal BackendToken of obj
+type BackendToken<'a> = BackendToken of obj
 
 (*
     Note: on `Either<'L, 'R>` and `EffectResult<'A>` semantics.

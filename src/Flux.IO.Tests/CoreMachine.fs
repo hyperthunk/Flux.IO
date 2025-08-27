@@ -98,7 +98,7 @@ module CoreMachine =
                 return Asynchronous(value, delay)
             })
             (1, Gen.constant (Failing (InvalidOperationException("test error"))))
-            (1, Gen.constant Cancelling)
+            // (1, Gen.constant Cancelling)
         ]
         
     let createFlow behavior : Flow<int> =
@@ -106,24 +106,21 @@ module CoreMachine =
         | Synchronous value -> 
             Flow.ret value
         | Asynchronous(value, delayMs) ->
-            //TODO: FIXME - we NEED to reintroduce async operations
-            failwith "Not implemented"
-            (* Flow (fun _ ct ->
-                ValueTask<int>(task {
-                    do! Task.Delay(delayMs, ct)
-                    return value
-                })) *)
+            flow {
+                do! Lift.taskF (fun () ->
+                    task {
+                        do! Task.Delay delayMs
+                        return ()
+                    })
+                return value
+            }
         | Failing ex ->
-            failwith "Not implemented: not even sure how these map now???"
-            (* Flow (fun _ _ ->
-                ValueTask<int>(Task.FromException<int>(ex))) *)
-        | Cancelling ->
+            flow {
+                raise ex
+                return 0 // unreachable
+            }
+        | _ ->
             failwith "Not implemented: cancellation needs to be refactored"
-            (* Flow (fun _ ct ->
-                ValueTask<int>(task {
-                    ct.ThrowIfCancellationRequested()
-                    return 0
-                })) *)
                 
     // Generate different StreamCommand results
     let genStreamCommand<'T> (genPayload: Gen<'T>) =

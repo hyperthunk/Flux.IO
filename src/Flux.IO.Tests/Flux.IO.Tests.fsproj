@@ -19,6 +19,7 @@
     <Compile Include="CoreIntegrationPipeline.fs" />
     <Compile Include="CoreIntegrationMachine.fs" />
     <Compile Include="CoreIntegrationTests.fs" />
+    <Compile Include="IntermediaryModelTests.fs" />
     <!-- <Compile Include="CoreStreamProcessing.fs" /> -->
     <Compile Include="Main.fs" />
   </ItemGroup>
