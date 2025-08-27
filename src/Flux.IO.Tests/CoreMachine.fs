@@ -154,16 +154,19 @@ module CoreMachine =
                 match behavior with
                 | Synchronous _ -> Flow.ret streamCmd
                 | Asynchronous(_, delayMs) ->
-                    failwith "Not implemented"
-                    (* Flow (fun _ ct ->
-                        ValueTask<StreamCommand<'b>>(task {
-                            do! Task.Delay(delayMs, ct)
-                            return streamCmd
-                        })) *)
+                    flow {
+                        do! Lift.taskF (fun () ->
+                            task {
+                                do! Task.Delay delayMs
+                                return ()
+                            })
+                        return streamCmd
+                    }
                 | Failing ex ->
-                    failwith "Not implemented"
-                    (* Flow (fun _ _ ->
-                        ValueTask<StreamCommand<'b>>(Task.FromException<StreamCommand<'b>>(ex))) *)
+                    flow {
+                        raise ex
+                        return streamCmd // unreachable
+                    }
                 | Cancelling ->
                     failwith "Not implemented: cancellation needs to be refactored"
                     (* Flow (fun _ ct ->
@@ -219,7 +222,7 @@ module CoreMachine =
                         | Left (Choice1Of2 cmd) -> cmd
                         | _ -> Right (TimeoutException() :> exn) // treat as timeout
                     | None ->
-                        run env (* cancellationToken *) flowResult 
+                        run env flowResult 
                         |> fun r -> r.Result
                         |> function
                         | Left _ as cmd -> cmd

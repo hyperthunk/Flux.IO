@@ -1,7 +1,5 @@
 namespace Flux.IO.Tests
 
-open Flux.IO
-// open Flux.IO.Core1
 open Flux.IO.Core.Types
 open Flux.IO.Pipeline.Direct
 open FsCheck
@@ -9,10 +7,7 @@ open FSharp.HashCollections
 open Newtonsoft.Json
 open System
 open System.Collections.Concurrent
-open System.Collections.Generic
-open System.Data
-open System.Threading    
-open System.Threading.Tasks
+open System.Threading
 
 module Generators = 
 
