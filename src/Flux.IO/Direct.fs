@@ -5,6 +5,7 @@ namespace Flux.IO.Pipeline
 *)
 module Direct = 
     open Flux.IO.Core.Types
+    open Flux.IO.Streams
     open System
     open System.Threading
     open System.Threading.Tasks
@@ -569,6 +570,8 @@ module Direct =
     module Intermediary =
 
         open FSharp.HashCollections
+        open Flux.IO.Core.Types
+        open Outlets
 
         (* Internal state for a single in-flight offloaded effect. *)
         type private SingleForkState<'In,'Eff,'Out> =
@@ -577,14 +580,246 @@ module Direct =
             | Emitting of Envelope<'Out>
             | Faulted of exn
         
-        let private mapPayload<'In,'Out> (payload:'Out) (e:Envelope<'In>) : Envelope<'Out> =
-            { Payload = payload
-              Headers = e.Headers
-              SeqId = e.SeqId
-              SpanCtx = e.SpanCtx
-              Ts = e.Ts
-              Attrs = e.Attrs
-              Cost = e.Cost }
+        let private mapPayload<'In,'Out> 
+                (payload:'Out) 
+                (e:Envelope<'In>) : Envelope<'Out> =
+            { 
+                Payload = payload
+                Headers = e.Headers
+                SeqId = e.SeqId
+                SpanCtx = e.SpanCtx
+                Ts = e.Ts
+                Attrs = e.Attrs
+                Cost = e.Cost 
+            }
+        
+        (* Private single in-flight record (immutable; replaced on mutation) *)
+        type private InFlight<'In,'Out> =
+            { 
+                Original  : Envelope<'In>
+                Outlet    : EffectOutlet<'Out>
+                StartedAt : int64 
+            }
+
+        (* Attribute key configuration (all optional; when None a key is not written) *)
+        type OutletAttrKeys =
+            { 
+                Latency     : string option
+                Kind        : string option
+                BatchCount  : string option
+                Error       : string option
+                Complete    : string option 
+            } with
+            static member Default =
+                { 
+                    Latency    = Some "fork.latencyMs"
+                    Kind       = Some "outlet.kind"
+                    BatchCount = Some "outlet.batchCount"
+                    Error      = Some "outlet.error"
+                    Complete   = Some "outlet.complete" 
+                }
+
+        type ForkStreamConfig =
+            { 
+                BatchMax         : int option
+                EmitEmptyBatches : bool
+                MaxInFlight      : int
+                AttrKeys         : OutletAttrKeys
+            }
+            static member Default =
+                { 
+                    BatchMax = Some 32
+                    EmitEmptyBatches = false
+                    MaxInFlight = 32
+                    AttrKeys = OutletAttrKeys.Default
+                }
+
+        // Internal state container (encapsulated mutable, not exposed)
+        // TODO: rework to use FSharp.Data.Adaptive
+        type private StreamForkState<'In,'Out>() =
+            let mutable inflight : InFlight<'In,'Out> list = []
+            member __.InFlight = inflight
+            member __.Add (f: InFlight<'In,'Out>) =
+                inflight <- f :: inflight
+            member __.Replace (fs: InFlight<'In,'Out> list) =
+                inflight <- fs
+            member __.Count = inflight.Length
+        
+        let inline private withPayload 
+                (payload: 'Out) 
+                (orig: Envelope<'In>) : Envelope<'Out> =
+            { 
+                Payload = payload
+                Headers = orig.Headers
+                SeqId   = orig.SeqId
+                SpanCtx = orig.SpanCtx
+                Ts      = orig.Ts
+                Attrs   = orig.Attrs
+                Cost    = orig.Cost 
+            }
+
+        let inline private addAttrs
+                (baseMap: HashMap<string, Attribute>) 
+                (adds: (string * Attribute) list) =
+            if adds.IsEmpty then baseMap
+            else
+                (baseMap, adds) ||> List.fold (fun acc (k,v) -> HashMap.add k v acc)
+
+        let private tryStartOutlet
+                (cfg: ForkStreamConfig)
+                (env: ExecutionEnv)
+                (startOutlet: 'In -> Flow<EffectOutlet<'Out>>)
+                (incoming: Envelope<'In>)
+                (state: StreamForkState<'In,'Out>) : exn option =
+            if state.Count >= cfg.MaxInFlight then None else
+            try
+                let outletFlow = startOutlet incoming.Payload
+                // Minimal synchronous interpreter (for the Direct path)
+                let rec run (env: ExecutionEnv) (prog: FlowProg<_>) =
+                    match prog with
+                    | FPure th -> th()
+                    | FSync f -> f env
+                    | FExternal spec ->
+                        // Fallback: if a blocking external sneaks in, we will await (not ideal, but graceful).
+                        let h = spec.Build env
+                        let eh = h.Start()
+                        match eh.Await() with
+                        | EffectDone (ValueSome v) -> v
+                        | EffectFailed ex -> raise ex
+                        | EffectCancelled oce -> raise oce
+                        | EffectDone ValueNone -> raise (InvalidOperationException "External returned no value")
+                        | EffectPending -> raise (InvalidOperationException "Unexpected pending external")
+                    | FDelay th -> run env (th())
+                    | FTryWith (b,h) ->
+                        try run env b with ex -> run env (h ex)
+                    | FTryFinally (b,fin) ->
+                        try
+                            let r = run env b
+                            fin(); r
+                        with ex -> fin(); reraise()
+
+                let outlet = run env outletFlow.Program
+                state.Add { Original = incoming; Outlet = outlet; StartedAt = env.NowUnix() }
+                None
+            with ex ->
+                Some ex
+
+        (* 
+            Drain a single inflight outlet producing:
+            - updated survivor decision
+            - list of newly drained envelopes (possibly empty)
+            - flag whether outlet consumed/removed 
+        *)
+        let private drainOne
+                (cfg: ForkStreamConfig)
+                (env: ExecutionEnv)
+                (inflight: InFlight<'In,'Out>) : bool * Envelope<'Out> list =
+            match drain cfg.BatchMax inflight.Outlet with
+            | Pending ->
+                // Still pending, keep it
+                true, []
+            | Drained (items, isComplete, maybeErr) ->
+                if items.IsEmpty && not cfg.EmitEmptyBatches then
+                    // No emission, but may still remove if completed
+                    if not isComplete then true, [] else
+                    // Completed with no items (emitEmptyBatches = false) -> remove
+                    false, []
+                else
+                    // Build envelopes
+                    // Pre-calculate attributes common to all items
+                    let keys = cfg.AttrKeys
+                    let latencyOpt =
+                        match keys.Latency with
+                        | Some key when inflight.Outlet.IsCompleted ->
+                            let latency = env.NowUnix() - inflight.StartedAt
+                            Some (key, AttrInt64 latency)
+                        | _ -> None
+                    let kindOpt =
+                        keys.Kind |> Option.map (fun k -> k, AttrString (inflight.Outlet.Kind.ToString()))
+                    let batchOpt =
+                        keys.BatchCount |> Option.map (fun k -> k, AttrInt32 items.Length)
+                    let errOpt =
+                        match maybeErr, keys.Error with
+                        | Some e, Some key -> Some (key, AttrString e.Message)
+                        | _ -> None
+                    let completeOpt =
+                        if isComplete then keys.Complete |> Option.map (fun k -> k, AttrBool true)
+                        else None
+
+                    let baseAdds =
+                        [ latencyOpt; kindOpt; batchOpt; errOpt; completeOpt ]
+                        |> List.choose id
+
+                    let drainedEnvelopes =
+                        items
+                        |> List.map (fun payload ->
+                            let e0 = withPayload payload inflight.Original
+                            let newAttrs = addAttrs e0.Attrs baseAdds
+                            { e0 with Attrs = newAttrs })
+
+                    // Keep if not complete
+                    if not isComplete then true, drainedEnvelopes else false, drainedEnvelopes
+
+        (* Drain all outlets respecting batch max.  Returns (survivors, drained envelopes). *)
+        let private drainAll
+                (cfg: ForkStreamConfig)
+                (env: ExecutionEnv)
+                (state: StreamForkState<'In,'Out>) : InFlight<'In,'Out> list * Envelope<'Out> list =
+            let mutable survivors : InFlight<'In,'Out> list = []
+            let mutable drained : Envelope<'Out> list = []
+            let batchLimit = cfg.BatchMax |> Option.defaultValue Int32.MaxValue
+
+            let mutable continueLoop = true
+            for inflight in state.InFlight do
+                if continueLoop then
+                    let keep, produced = drainOne cfg env inflight
+                    drained <- drained @ produced
+                    if keep then survivors <- inflight :: survivors
+                    if drained.Length >= batchLimit then
+                        // Respect global batch limit across outlets
+                        continueLoop <- false
+                else
+                    survivors <- inflight :: survivors
+            // survivors currently in reverse order of processing if trimmed early; 
+            // reversing not necessary functionally
+            survivors, drained
+
+        
+        (* 
+            Generalized outlet-based fork:
+            startOutlet : 'In -> Flow<IEffectOutlet<'Out>>
+            Strategy:
+            - For each input envelope (if capacity allows) start a new outlet and store.
+            - On every invocation also poll existing outlets; emit at most one batch of drained items.
+            - When an outlet completes (and its queue drained) remove it. 
+        *)
+        let forkOutlet
+            (cfg: ForkStreamConfig)
+            (startOutlet : 'In -> Flow<EffectOutlet<'Out>>)
+            : StreamProcessor<'In,'Out> =
+            let state = StreamForkState<'In,'Out>()
+            StreamProcessor (fun (envIn: Envelope<'In>) ->
+                { Program =
+                    FSync (fun execEnv ->
+
+                        // 1. Attempt to start a new outlet (capture any exception)
+                        let startError = tryStartOutlet cfg execEnv startOutlet envIn state
+
+                        // 2. If starting failed, surface Error immediately (no draining this tick)
+                        match startError with
+                        | Some ex -> Error ex
+                        | None ->
+                            // 3. Drain what's available
+                            let survivors, drained = drainAll cfg execEnv state
+                            state.Replace survivors
+
+                            // 4. Emit command
+                            match drained with
+                            | []      -> Consume
+                            | [one]   -> Emit one
+                            | many    -> EmitMany many
+                    )
+                })
 
         (* 
             Offload one effect per input envelope, emit result later.
@@ -692,6 +927,96 @@ module Direct =
             (mapResult : 'Eff -> 'Out)
             : StreamProcessor<'In,'Out> =
             forkSingle start (fun _ v -> mapResult v)
+
+        /// Adapts a single EffectHandle into an outlet.
+        let forkSingleOutlet
+                (start : 'In -> Flow<EffectHandle<'Out>>) : StreamProcessor<'In,'Out> =
+            forkOutlet
+                { ForkStreamConfig.Default with BatchMax = Some 1 }
+                (fun input ->
+                    let handleFlow = start input
+                    { Program =
+                        FSync (fun env ->
+                            let rec run env prog =
+                                match prog with
+                                | FPure th -> th()
+                                | FSync f -> f env
+                                | FExternal spec ->
+                                    let h = spec.Build env
+                                    let eh = h.Start()
+                                    match eh.Await() with
+                                    | EffectDone (ValueSome v) -> v
+                                    | EffectFailed ex -> raise ex
+                                    | EffectCancelled oce -> raise oce
+                                    | EffectDone ValueNone -> raise (InvalidOperationException "No value")
+                                    | EffectPending -> raise (InvalidOperationException "Pending external")
+                                | FDelay th -> run env (th())
+                                | FTryWith (b,h) -> try run env b with ex -> run env (h ex)
+                                | FTryFinally (b,fin) ->
+                                    try 
+                                        let r = run env b
+                                        fin()
+                                        r
+                                    with ex -> fin(); reraise()
+                            let h = run env handleFlow.Program
+                            Outlets.ofEffectHandle h
+                        )
+                    })
+
+        /// Starts an Async<'Out> thunk, obtains an EffectHandle<'Out>, then adapts it to an outlet.
+        /// Handles the (unlikely) case where a Flow<EffectHandle<'Out>> contains an external node
+        /// whose Start() itself returns an EffectHandle<EffectHandle<'Out>> (nested) by flattening.
+        let forkAsync
+                (cfg: ForkStreamConfig)
+                (work : 'In -> Async<'Out>) : StreamProcessor<'In,'Out> =
+            // Build: 'startOutlet : 'In -> Flow<IEffectOutlet<'Out>>
+            forkOutlet cfg (fun input ->
+                // Flow<EffectHandle<'Out>>
+                let handleFlow = Lift.asyncHandle (work input)
+                { Program =
+                    FSync (fun env ->
+                        // Local minimal interpreter returning EffectHandle<'Out>
+                        let rec run 
+                                (env: ExecutionEnv) 
+                                (prog: FlowProg<EffectHandle<'Out>>) : EffectHandle<'Out> =
+                            match prog with
+                            | FPure th -> th()
+                            | FSync f  -> f env
+                            | FDelay th -> run env (th())
+                            | FTryWith (body, handler) ->
+                                try run env body
+                                with ex -> run env (handler ex)
+                            | FTryFinally (body, fin) ->
+                                try
+                                    let r = run env body
+                                    fin(); r
+                                with ex ->
+                                    fin(); reraise()
+                            | FExternal spec ->
+                                // spec : ExternalSpec<EffectHandle<'Out>>
+                                // Starting it yields EffectHandle<EffectHandle<'Out>> (outer handle producing inner handle)
+                                let outerHandle =
+                                    let h = spec.Build env
+                                    h.Start()
+
+                                // Flatten: block (synchronously) until outer completes and extract inner
+                                let rec awaitOuter() =
+                                    match outerHandle.Poll() with
+                                    | EffectPending ->
+                                        // Very short spin; for direct path we accept blocking
+                                        Thread.SpinWait 40
+                                        awaitOuter()
+                                    | EffectDone (ValueSome inner) -> inner
+                                    | EffectDone ValueNone ->
+                                        raise (InvalidOperationException "External handle produced no inner handle")
+                                    | EffectFailed ex -> raise ex
+                                    | EffectCancelled oce -> raise oce
+                                awaitOuter()
+                        let effHandle = run env handleFlow.Program
+                        // Adapt to outlet
+                        Outlets.ofEffectHandle effHandle
+                    )
+                })
 
     module MBox =
             

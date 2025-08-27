@@ -8,6 +8,7 @@ module JsonTokenStreaming =
     open System.Text.Json
     open Flux.IO.Core.Types
     open Flux.IO.Pipeline.Direct
+    open Flux.IO.Streams
 
     type TokenEvent = {
         TokenType    : JsonTokenType

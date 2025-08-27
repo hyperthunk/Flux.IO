@@ -74,6 +74,7 @@ module CoreMachine =
     //open Flux.IO.Core1.Flow
 
     open Flux.IO.Core.Types
+    open Flux.IO.Streams
     open Flux.IO.Pipeline.Direct
     open FsCheck
     open FsCheck.Experimental

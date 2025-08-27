@@ -34,6 +34,7 @@ module IntegrationStages =
     open Flux.IO.Core.Types
     open Flux.IO.Pipeline.Direct
     open Generators.JsonGenerators
+    open Flux.IO.Streams
 
     /// Domain event produced by the accumulation stage.
     type AccumEvent =

@@ -76,6 +76,29 @@ type Envelope<'T> = {
                 Headers = f env.Headers
         }
 
+    member inline e.WithAttr (k: string, v: Attribute) =
+            { e with Attrs = e.Attrs |> FSharp.HashCollections.HashMap.add k v }
+
+    member inline e.WithAttrs (entries: (string * Attribute) seq) =
+        let merged =
+            entries
+            |> Seq.fold (fun acc (k,v) -> FSharp.HashCollections.HashMap.add k v acc) e.Attrs
+        { e with Attrs = merged }
+
+module EnvelopeAttributeKeys =
+    [<Literal>] 
+    let ForkLatency    = "fork.latencyMs"
+    [<Literal>] 
+    let ForkId         = "fork.effectId"
+    [<Literal>] 
+    let OutletBatch    = "outlet.batchCount"
+    [<Literal>] 
+    let OutletKind     = "outlet.kind"
+    [<Literal>] 
+    let OutletError    = "outlet.error"
+    [<Literal>] 
+    let OutletComplete = "outlet.complete"
+
 type Batch<'T> = 
     {
         Items: Envelope<'T> array
@@ -334,62 +357,6 @@ module Flow =
 
     let inline zero () : Flow<unit> = 
         { Program = FPure (fun () -> ()) }
-
-type StreamProcessor<'TIn, 'TOut> = 
-    | StreamProcessor of (Envelope<'TIn> -> Flow<StreamCommand<'TOut>>)
-
-module StreamProcessor =
-
-    // Run a processor on a single envelope
-    let runProcessor (StreamProcessor f) env = f env
-    
-    // Lift a pure function into a processor
-    let lift (f: 'a -> 'b) : StreamProcessor<'a, 'b> =
-        StreamProcessor (fun env ->
-            { Program = FSync (fun _ -> Emit (Envelope.map f env)) }
-        )
-
-    // Filter processor
-    let filter (predicate: 'a -> bool) : StreamProcessor<'a, 'a> =
-        StreamProcessor (fun env ->
-            {
-                Program = FSync (fun _ ->
-                    if predicate env.Payload then
-                        Emit env
-                    else
-                        Consume
-                )
-            }
-        )
-
-    // Stateful processor
-    let stateful 
-            (initial: 'state) 
-            (f: 'state -> 'a -> ('state * 'b option)) : StreamProcessor<'a, 'b> =
-        let state = ref initial
-        StreamProcessor (fun env ->
-            {
-                Program = FSync (fun _ ->
-                    let newState, result = f state.Value env.Payload
-                    state.Value <- newState
-                    match result with
-                    | Some value -> 
-                        Emit (Envelope.map (fun _ -> value) env)
-                    | None -> Consume
-                )
-            }
-        )
-
-(*     let withEnv (f: ExecutionEnv -> 'a -> Flow<'b>) : StreamProcessor<'a, 'b> =
-        StreamProcessor (fun env ->
-            {
-                Program = FSync (fun execEnv ->
-                    let result = f execEnv env.Payload
-                    Emit (Envelope.map (fun _ -> result) env)
-                )
-            }
-        )
- *)
 
 module Core = 
     open FSharpPlus
