@@ -463,7 +463,7 @@ module TestEnv =
         let gauges   = ConcurrentDictionary<string,float>()
         let hgrams   = ConcurrentDictionary<string,ResizeArray<float>>()
         
-        interface IMetrics with
+        interface Metrics with
             member __.RecordCounter(name, _, value) =
                 counters.AddOrUpdate(name, value, fun _ old -> old + value) |> ignore
 
@@ -479,7 +479,7 @@ module TestEnv =
 
     type InMemTracer() =
         let spans = ResizeArray<string>()
-        interface ITracer with
+        interface Tracer with
             member _.StartSpan name _parent =
                 spans.Add(name)
                 { TraceId = Guid.NewGuid().ToString()
@@ -495,7 +495,7 @@ module TestEnv =
         let lines = ResizeArray<string>()
         let errors = ResizeArray<string * string>()
         
-        interface ILogger with
+        interface Logger with
             member __.Log(level,msg) =
                 lines.Add(sprintf "[%s] %s" level msg)
             member __.LogError(msg,ex) =
@@ -505,7 +505,7 @@ module TestEnv =
         member __.Errors = errors
 
     type DummyPool() =
-        interface IMemoryPool with
+        interface MemoryPool with
             member _.RentBuffer(size) = ArraySegment<byte>(Array.zeroCreate size)
             member _.ReturnBuffer(_b) = ()
 
@@ -513,10 +513,10 @@ module TestEnv =
         let metrics = InMemMetrics()
         let tracer  = InMemTracer()
         let logger  = InMemLogger()
-        { Metrics = metrics :> IMetrics
-          Tracer  = tracer  :> ITracer
-          Logger  = logger  :> ILogger
-          Memory  = DummyPool() :> IMemoryPool 
+        { Metrics = metrics :> Metrics
+          Tracer  = tracer  :> Tracer
+          Logger  = logger  :> Logger
+          Memory  = DummyPool() :> MemoryPool 
           NowUnix = fun () -> DateTimeOffset.UtcNow.ToUnixTimeSeconds()
           //Services = Map.empty
         },

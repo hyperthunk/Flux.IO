@@ -2,11 +2,8 @@ namespace Flux.IO.Core.Types
 
 open FSharp.Control
 open FSharp.HashCollections
-// open FSharpPlus
-open System.Collections.Generic
 open System
 open System.Threading
-open System.Threading.Tasks
 
 type Timestamp = int64
 
@@ -261,30 +258,32 @@ type ExternalHandle<'T> =
     abstract member IsCompleted : bool
     abstract member Start       : unit -> EffectHandle<'T>
 
-type IMetrics =
+type Metrics =
     abstract RecordCounter: name: string * tags: HashMap<string,string> * value: int64 -> unit
     abstract RecordGauge: name: string * tags: HashMap<string,string> * value: float -> unit
     abstract RecordHistogram: name: string * tags: HashMap<string,string> * value: float -> unit
 
-type ITracer =
+[<Interface>]
+type Tracer =
     abstract StartSpan: name: string -> parent: TraceContext option -> TraceContext
     abstract EndSpan: ctx: TraceContext -> unit
     abstract AddEvent: ctx: TraceContext -> name:string -> attrs:HashMap<string,obj> -> unit
 
 [<Interface>]
-type ILogger =
+type Logger =
     abstract member Log: level:string * message: string -> unit
     abstract member LogError: message: string * exn: exn -> unit
 
-type IMemoryPool =
+[<Interface>]
+type MemoryPool =
     abstract RentBuffer: size:int -> ArraySegment<byte>
     abstract ReturnBuffer: buffer: ArraySegment<byte> -> unit
 
 type ExecutionEnv = { 
-    Metrics  : IMetrics
-    Tracer   : ITracer
-    Logger   : ILogger
-    Memory   : IMemoryPool
+    Metrics  : Metrics
+    Tracer   : Tracer
+    Logger   : Logger
+    Memory   : MemoryPool
     NowUnix  : unit -> int64
     //Services : Map<string,obj> 
 }

@@ -37,7 +37,7 @@ module Direct =
     (* 
         Note: Single-step, flattening Interpreter primitive 
 
-        Evaluating `runExternal` has runProg evaluate a FlowProg<'T> into a ValueTask<'T>. 
+        Evaluating `runExternal` has runProg evaluate a FlowProg<'T> into an EffectResult<'T>. 
         External effects are executed by obtaining an ExternalHandle<'T> and polling/waiting 
         (currently this is a naive blocking loop).
         

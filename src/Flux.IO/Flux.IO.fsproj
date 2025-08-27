@@ -8,7 +8,6 @@
     <Compile Include="Types.fs" />
     <Compile Include="Collections.fs" />
     <Compile Include="Direct.fs" />
-    <Compile Include="Core.fs" />
     <Compile Include="Flow.fs" />
   </ItemGroup>
   <Import Project="..\..\.paket\Paket.Restore.targets" />

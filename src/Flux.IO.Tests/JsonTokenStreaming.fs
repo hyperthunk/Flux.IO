@@ -6,9 +6,8 @@ module JsonTokenStreaming =
     open System.Buffers
     open System.Collections.Generic
     open System.Text.Json
-    open Flux.IO
-    open Flux.IO.Core1
-    open Flux.IO.Core1.Flow
+    open Flux.IO.Core.Types
+    open Flux.IO.Pipeline.Direct
 
     type TokenEvent = {
         TokenType    : JsonTokenType
@@ -120,7 +119,7 @@ module JsonTokenStreaming =
                                 let cmd =
                                     if s1.Pending.Count > 0 then
                                         let ev = s1.Pending.Dequeue()
-                                        Emit (mapEnvelope (fun _ -> ev) env)
+                                        Emit (Envelope.map (fun _ -> ev) env)
                                     else if s1.RootCompleted then Complete
                                     else Consume
                                 flow { return cmd }
@@ -130,7 +129,7 @@ module JsonTokenStreaming =
                             let cmd =
                                 if s1.Pending.Count > 0 then
                                     let ev = s1.Pending.Dequeue()
-                                    Emit (mapEnvelope (fun _ -> ev) env)
+                                    Emit (Envelope.map (fun _ -> ev) env)
                                 else if s1.RootCompleted then Complete
                                 else Consume
                             flow { return cmd }
@@ -140,7 +139,7 @@ module JsonTokenStreaming =
                         let cmd =
                             if s1.Pending.Count > 0 then
                                 let ev = s1.Pending.Dequeue()
-                                Emit (mapEnvelope (fun _ -> ev) env)
+                                Emit (Envelope.map (fun _ -> ev) env)
                             else if s1.RootCompleted then Complete
                             else Consume
                         flow { return cmd })
