@@ -1,5 +1,8 @@
 namespace Flux.IO.Pipeline
 
+(*
+    Direct Pipeline API
+*)
 module Direct = 
     open Flux.IO.Core.Types
     open System
@@ -40,11 +43,8 @@ module Direct =
         
         Integration with scheduler or event loop is TODO/FIXME.
     *)
-    
-    
     let runExternal 
-            (env: ExecutionEnv) 
-            (* (ct: CancellationToken) *) 
+            (env: ExecutionEnv)
             (spec: ExternalSpec<'T>) : EffectResult<'T> =
         // TODO: Non-blocking integration with scheduler / registration
         // TODO: Timeout / cancellation bridging
@@ -62,7 +62,6 @@ module Direct =
             with _ -> ()
         ) *)
         
-        // Simply wait for the result
         let result =
             try asyncHandle.Await()
             with ex ->
@@ -83,9 +82,8 @@ module Direct =
             // Should not happen after Await()
             raise (InvalidOperationException "Await returned Pending")
 
-    let rec execute 
-            (env: ExecutionEnv) 
-            (* (ct: CancellationToken)  *)
+    let rec execute
+            (env: ExecutionEnv)
             (prog: FlowProg<'T>) : EffectResult<'T> =
         match prog with
         | FPure th ->
@@ -95,10 +93,10 @@ module Direct =
             try f env |> ValueSome |> EffectDone
             with ex -> EffectFailed ex
         | FExternal spec ->
-            runExternal env (* ct *) spec
+            runExternal env spec
         | FDelay thunk ->
             // Do not evaluate thunk early; just proceed when executed
-            try execute env (* ct *) (thunk())
+            try execute env (thunk())
             with ex -> EffectFailed ex
         | FTryWith (body, handler) ->
             try execute env body
@@ -112,18 +110,19 @@ module Direct =
                 fin()
                 reraise()
 
-    (* Monadic Operations (where no structural bind nodes are stored) *)
+    (* 
+        Monadic Operations 
     
-    
-    // Sequencing: run m under the current env/ct, then run k a, all inside a single FSync,
-    // so there is no structural bind node and no boxing/sentinels. This is a blocking
-    // composition by design (Direct path).
-    //
-    // NOTE:
-    //  - Explicit generic ordering: k first, then m, helps solver keep 'A and 'B distinct.
-    //  - Ambient.ct is set by Direct.run at the root; we rely on it here
-    //    so FSync can observe the correct CancellationToken.
-    //  - This preserves referential transparency at the API surface while executing eagerly.
+        NOTE: Sequencing 
+        
+        We run m under the current env/ct, then run k a, all inside a 
+        single FSync, so there is no structural bind node and no boxing/sentinels. 
+        This is a blocking composition by design (Direct path).
+        
+        NOTE:
+        - Explicit generic ordering: k first, then m, helps solver keep 'A and 'B distinct.
+        - This preserves referential transparency at the API surface while executing eagerly. 
+    *)
     let inline bind<'A,'B> (k: 'A -> Flow<'B>) (m: Flow<'A>) : Flow<'B> =
         { Program =
             FSync (fun env ->
@@ -196,7 +195,6 @@ module Direct =
                     Unchecked.defaultof<'B>
                 )) } *)
 
-    // map implemented via bind -> return
     let inline map<'A,'B> (f: 'A -> 'B) (m: Flow<'A>) : Flow<'B> =
         bind (f >> pure') m
 
@@ -220,6 +218,12 @@ module Direct =
 
         member _.Bind (m: Flow<'A>, k: 'A -> Flow<'B>) : Flow<'B> =
             bind k m
+
+        member _.Bind (spec: ExternalSpec<'T>, k: 'T -> Flow<'U>) : Flow<'U> =
+            bind k (externalSpec spec)
+
+        member _.ReturnFrom (spec: ExternalSpec<'T>) : Flow<'T> =
+            externalSpec spec
 
         member _.Zero () : Flow<unit> = pure' ()
 
@@ -263,7 +267,6 @@ module Direct =
         member _.Yield (act: ExecutionEnv -> unit) : Flow<unit> =
             sync (fun env -> act env)
 
-        // Source pass-through
         member _.Source (m: Flow<'T>) = m
 
     let flow = FlowBuilder()
@@ -293,8 +296,8 @@ module Direct =
             | ex ->
                 EffectFailed ex
 
-        /// Lift a Task<'T> by eagerly wrapping as ExternalSpec (simple adapter).
-        let task(factory: unit -> Task<'T>) : Flow<'T> =
+        /// Lift a Task<'T> by eagerly wrapping as ExternalSpec.
+        let task(factory: unit -> Task<'T>) : ExternalSpec<'T> =
             let spec =
                 { 
                     Build = fun _ ->
@@ -358,10 +361,14 @@ module Direct =
                     Classify = EffectExternal "Task"
                     DebugLabel = Some "lift-task" 
                 }
-            externalSpec spec
+            in spec
+        
+        /// Lift a Task<'T> into the Flow monad.
+        let taskF(factory: unit -> Task<'T>) : Flow<'T> =
+            task factory |> externalSpec 
 
-        /// Lift Async<'T>
-        let async (comp: Async<'T>) : Flow<'T> =
+        /// Lift Async<'T> by eagerly wrapping as ExternalSpec.
+        let async (comp: Async<'T>) : ExternalSpec<'T> =
             let spec = { 
                 Build = fun _ ->
                     let cts = new CancellationTokenSource()
@@ -431,10 +438,13 @@ module Direct =
                 Classify = EffectExternal "Async"
                 DebugLabel = Some "lift-async" 
             }
-            externalSpec spec
+            in spec
 
-        // Start (build + start) an ExternalSpec returning the raw EffectHandle<'T> without awaiting completion.
-        // This is synchronous and allocation-light: it executes only the builder and Start().
+        /// Lift and Async<'T> into the Flow monad.        
+        let asyncF (comp: Async<'T>) : Flow<'T> = async comp |> externalSpec
+
+        /// Start (build + start) an ExternalSpec returning the raw EffectHandle<'T> without awaiting completion.
+        /// This is synchronous and allocation-light: it executes only the builder and Start().
         let effectHandle (spec: ExternalSpec<'T>) : Flow<EffectHandle<'T>> =
             { Program =
                 FSync (fun env ->
@@ -512,7 +522,7 @@ module Direct =
                 (fun () -> cts.Dispose())
                 env
 
-        // Non-blocking start for a Task-producing factory; returns an EffectHandle.
+        /// Non-blocking start for a Task-producing factories.
         let taskHandle (factory: unit -> Task<'T>) : Flow<EffectHandle<'T>> =
             // 'task' currently blocks (awaits). We need a fresh spec that does NOT block.
             // Provide a minimal spec replicating the logic but returning handle directly.
@@ -524,7 +534,7 @@ module Direct =
                 }
             in effectHandle spec
 
-        // Non-blocking start for Async<'T>; returns an EffectHandle<'T>.
+        /// Non-blocking start for Async<'T> work.
         let asyncHandle (comp: Async<'T>) : Flow<EffectHandle<'T>> =
             let spec =
                 {
@@ -535,10 +545,10 @@ module Direct =
             in effectHandle spec
 
     (* Intermediary module: offload + later emission (Phase 1 refactoring) *)
+
     module Intermediary =
 
         open FSharp.HashCollections
-        open Flux.IO.Core.Types
 
         (* Internal state for a single in-flight offloaded effect. *)
         type private SingleForkState<'In,'Eff,'Out> =
@@ -588,30 +598,34 @@ module Direct =
                                 | FPure th -> th()
                                 | FSync f -> f env
                                 | FExternal spec ->
-                                    // Build/start returning handle (non-blocking) is not expected here
-                                    // Because we rely on start returning a handle via FSync route.
+                                    (* 
+                                        NOTE: Build/start returning handle (non-blocking) 
+                                        is not expected here, since we rely on start returning a
+                                        handle via the FSync route.
+
+                                        We arrive at blocking semantics for FExternal and for correctness
+                                        attempt to await. If we've arrived here, this is a fallback.
+                                    *)
                                     let h = spec.Build env
                                     let ah = h.Start()
-                                    // BLOCKING semantics for FExternal in Direct path remain, but
-                                    // for correctness we attempt to await. If this is reached it's a fallback.
                                     match ah.Await() with
                                     | EffectDone (ValueSome v) -> v
                                     | EffectFailed ex -> raise ex
                                     | EffectCancelled oce -> raise oce
                                     | _ -> failwith "Unexpected pending external in forkSingle fallback path."
-                                | FDelay th -> run env (* ct *) (th())
+                                | FDelay th -> run env (th())
                                 | FTryWith (body, handler) ->
-                                    try run env (* ct *) body
-                                    with ex -> run env (* ct *) (handler ex)
+                                    try run env body
+                                    with ex -> run env (handler ex)
                                 | FTryFinally (body, fin) ->
                                     try
-                                        let r = run env (* ct *) body
+                                        let r = run env body
                                         fin()
                                         r
                                     with _ ->
                                         fin()
                                         reraise()
-                            let handle = run execEnv (* CancellationToken.None *) flowHandle.Program
+                            let handle = run execEnv flowHandle.Program
                             state <- Running (envIn, handle, execEnv.NowUnix())
                             Consume
                         | Running (orig, handle, startedAt) ->
@@ -639,11 +653,11 @@ module Direct =
                                 state <- Faulted oce
                                 Error oce
                             | EffectDone ValueNone ->
-                                // Consider treating as protocol error
+                                // TODO: Consider treating as protocol error
                                 state <- Faulted (InvalidOperationException "Effect completed without value.")
                                 Error (InvalidOperationException "Empty effect result")
                         | Emitting _ ->
-                            // Transitional state not currently used – treat as Complete
+                            // FIXME: Transitional state not currently used – treat as Complete
                             state <- Idle
                             Complete
                         | Faulted ex ->
@@ -652,7 +666,7 @@ module Direct =
                     )
                 })
 
-        // Convenience version that maps result directly (project only value)
+        /// Projects an external effect that yields a single value.
         let forkSingleValue<'In, 'Eff, 'Out>
             (start : 'In -> Flow<EffectHandle<'Eff>>)
             (mapResult : 'Eff -> 'Out)
@@ -682,7 +696,6 @@ module Direct =
                                 let! msg = inbox.Receive()
                                 match msg with
                                 | Start reply ->
-                                    // Start the computation
                                     Async.StartWithContinuations(
                                         comp,
                                         (fun value -> 
@@ -785,23 +798,22 @@ module Direct =
     
     module Async =
         
-        // Represents a already started async operation that can be checked multiple times
-        type StartedAsync<'T> = {
-            Poll: unit -> EffectResult<'T>          // Non-blocking check
-            Await: unit -> EffectResult<'T>         // Blocking wait
-            AwaitTimeout: TimeSpan -> EffectResult<'T>  // Blocking wait with timeout
-            Cancel: unit -> unit
-            IsCompleted: unit -> bool
-        }
+        (* Represents a running async operation that can be checked multiple times *)
+        type StartedAsync<'T> = 
+            {
+                Poll: unit -> EffectResult<'T>               // Non-blocking check
+                Await: unit -> EffectResult<'T>              // Blocking wait
+                AwaitTimeout: TimeSpan -> EffectResult<'T>   // Blocking wait with timeout
+                Cancel: unit -> unit
+                IsCompleted: unit -> bool
+            }
 
-        /// Start an async computation that can be checked multiple times
+        /// Start an async computation that can be checked multiple times.
         let startAsync (asyncWork: Async<'T>) : Async<StartedAsync<'T>> =
             async {
                 let completed = new ManualResetEventSlim(false)
                 let mutable result = EffectPending
                 let cts = new CancellationTokenSource()
-                
-                // Start the computation with continuations
                 Async.StartWithContinuations(
                     asyncWork,
                     (fun value -> 
@@ -838,13 +850,13 @@ module Direct =
                 }
             }
 
-        /// Run async work with timeout, returning either the result or the handle to check later
+        /// Run async work with a timeout, returning either the result or the handle to check later.
         let withTimeout 
                 (timeout: TimeSpan) 
                 (asyncWork: Async<'T>) : Flow<Choice<'T, StartedAsync<'T>>> =
             flow {
                 // Start the async work
-                let! started = Lift.async (startAsync asyncWork)
+                let! started = Lift.asyncF (startAsync asyncWork)
                 
                 // Try to get result within timeout
                 match started.AwaitTimeout timeout with
@@ -859,7 +871,7 @@ module Direct =
                     return Choice2Of2 started
             }
 
-        /// Helper to retry a timed-out operation
+        /// Retries a previously timed-out operation
         let retryTimeout 
                 (timeout: TimeSpan) 
                 (started: StartedAsync<'T>) : Async<Choice<'T, StartedAsync<'T>>> =
@@ -876,6 +888,9 @@ module Direct =
                     return Choice2Of2 started
             }
 
+        //TODO: rewrite this with a proper backoff ~ see link
+        // https://github.com/haskell-distributed/distributed-process/blob/2edcdf0a22a968be22b7d81554ae1446c1f45f0e/packages/distributed-process-supervisor/src/Control/Distributed/Process/Supervisor.hs#L1209
+        
         /// Progressive timeout with retries
         let withProgressiveTimeout 
                 (timeouts: TimeSpan list) 
@@ -902,7 +917,7 @@ module Direct =
                                     | Choice2Of2 _ -> return! tryRemaining rest
                             }
                         
-                        return! Lift.async (tryRemaining remainingTimeouts)
+                        return! Lift.asyncF (tryRemaining remainingTimeouts)
             }
 
         /// Start multiple async operations and check them with timeout
@@ -915,7 +930,7 @@ module Direct =
                     asyncWorks
                     |> List.map startAsync
                     |> Async.Parallel
-                    |> Lift.async
+                    |> Lift.asyncF
                 
                 // Check each with timeout
                 let! results =
@@ -928,48 +943,16 @@ module Direct =
                         }
                     )
                     |> Async.Parallel
-                    |> Lift.async
+                    |> Lift.asyncF
                 
                 return Array.toList results
             }
-
-        // Example usage showing the power of returning StartedAsync
-        let startAsyncTest() = flow {
-            let longRunningWork = async {
-                do! Async.Sleep 5000
-                return "Finally done!"
-            }
-            
-            // Try with 1 second timeout
-            let! firstTry = withTimeout (TimeSpan.FromSeconds 1.) longRunningWork
-            
-            match firstTry with
-            | Choice1Of2 result ->
-                printfn "Got result quickly: %s" result
-                return result
-            | Choice2Of2 started ->
-                printfn "Timed out after 1 second, doing other work..."
-                
-                // Do some other work while waiting
-                do! Lift.async (Async.Sleep 2000)
-                
-                // Check again with 3 second timeout
-                let! secondTry = Lift.async (retryTimeout (TimeSpan.FromSeconds 3.) started)
-                
-                match secondTry with
-                | Choice1Of2 result ->
-                    printfn "Got result on retry: %s" result
-                    return result
-                | Choice2Of2 _ ->
-                    printfn "Still not ready, giving up"
-                    return "Default value"
-        }
 
         /// Create a Flow that runs async work without blocking, with explicit continuation
         let fork (asyncWork: Async<'T>) (continuation: 'T -> Flow<'R>) : Flow<'R> =
             flow {
                 // Start the async work
-                let! result = Lift.async asyncWork
+                let! result = Lift.asyncF asyncWork
                 // Continue with the result
                 return! continuation result
             }
@@ -981,7 +964,7 @@ module Direct =
                 // Start all async operations
                 let! tasks = 
                     asyncWorks 
-                    |> List.map Lift.async 
+                    |> List.map Lift.asyncF 
                     |> List.map (fun f -> flow { return! f })
                     |> List.fold (fun acc elem ->
                         flow {
@@ -1007,7 +990,7 @@ module Direct =
         
         // Yield control back to scheduler (useful in loops)
         member __.YieldControl() : Flow<unit> =
-            Lift.async (Async.SwitchToThreadPool())
+            Lift.asyncF (Async.SwitchToThreadPool())
 
     module StreamProcessor =
 
@@ -1027,7 +1010,7 @@ module Direct =
                 }
             )
 
-        // Monadic bind for stream processors
+        /// Monadic bind for stream processors.
         let bind 
                 (f: 'b -> StreamProcessor<'b, 'c>) 
                 (StreamProcessor p: StreamProcessor<'a, 'b>) : StreamProcessor<'a, 'c> =

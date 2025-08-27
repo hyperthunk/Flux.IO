@@ -210,13 +210,20 @@ module CoreMachine =
                     let flowResult = StreamProcessor.runProcessor processor envelope
                     match timeout with
                     | Some t ->
-                        failwith "Not implemented: timeouts need to be refactored"
-                        (* let timeoutFlow = Flow.withTimeout t flowResult
-                        match run env cancellationToken timeoutFlow |> fun vt -> vt.Result with
-                        | Some cmd -> cmd
-                        | None -> Error (TimeoutException()) *)
+                        // failwith "Not implemented: timeouts need to be refactored"
+                        let timeoutFlow = Async.withTimeout t <| async { 
+                            let cmdS = run env <| flow { let! r = flowResult in return r }
+                            return cmdS.Result
+                        }
+                        match run env timeoutFlow |> fun r -> r.Result with
+                        | Left (Choice1Of2 cmd) -> cmd
+                        | _ -> Right (TimeoutException() :> exn) // treat as timeout
                     | None ->
-                        run env (* cancellationToken *) flowResult |> fun vt -> vt.Result
+                        run env (* cancellationToken *) flowResult 
+                        |> fun r -> r.Result
+                        |> function
+                        | Left _ as cmd -> cmd
+                        | _ -> Right (TimeoutException() :> exn) // treat as timeout
                     (* Ok result *)
                 with
                 | ex -> Right ex
@@ -481,8 +488,7 @@ module CoreMachine =
             StreamProcessor (fun env ->
                 flow {
                     let delay = random.Next(minDelay, maxDelay)
-                    failwith "Not implemented: delays need to be refactored"
-                    // do! liftTask (task { do! Task.Delay delay })
+                    do! Lift.taskF (fun () -> task { do! Task.Delay delay })
                     return Emit (Envelope.map (fun x -> x * 2) env)
                 }
             )

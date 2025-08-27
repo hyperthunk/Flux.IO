@@ -153,7 +153,6 @@ module CoreTests =
                 let env,_,_,_ = TestEnv.mkEnv()
                 match run env (* CancellationToken.None *) StreamProcessor.ask with
                 | EffectDone (ValueSome got) ->
-                    printfn "Got environment: %A" got
                     Expect.isTrue (Object.ReferenceEquals(env, got)) "Environment identity must match"
                 | _ -> failtestf "Expected Execution Environment in run output"
 
