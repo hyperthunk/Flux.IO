@@ -794,9 +794,8 @@ module Direct =
             - When an outlet completes (and its queue drained) remove it. 
         *)
         let forkOutlet
-            (cfg: ForkStreamConfig)
-            (startOutlet : 'In -> Flow<EffectOutlet<'Out>>)
-            : StreamProcessor<'In,'Out> =
+                (cfg: ForkStreamConfig)
+                (startOutlet : 'In -> Flow<EffectOutlet<'Out>>) : StreamProcessor<'In,'Out> =
             let state = StreamForkState<'In,'Out>()
             StreamProcessor (fun (envIn: Envelope<'In>) ->
                 { Program =
@@ -962,6 +961,14 @@ module Direct =
                             Outlets.ofEffectHandle h
                         )
                     })
+
+        /// Start a single Async<'Out'> per input and emit once when it completes.
+        /// Subsequent calls while running only poll; no new async is started.
+        let forkAsyncSingle
+                (work : 'In -> Async<'Out>) : StreamProcessor<'In,'Out> =
+            forkSingle
+                (fun input -> Lift.asyncHandle (work input))
+                (fun _ v -> v)
 
         /// Starts an Async<'Out> thunk, obtains an EffectHandle<'Out>, then adapts it to an outlet.
         /// Handles the (unlikely) case where a Flow<EffectHandle<'Out>> contains an external node
