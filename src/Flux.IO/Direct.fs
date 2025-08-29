@@ -70,9 +70,10 @@ module Direct =
                 EffectFailed ex
 
         match result with
-        | EffectDone (ValueSome _) ->
+        | EffectOutput (ValueSome _) ->
             result
-        | EffectDone ValueNone -> 
+        | EffectOutput ValueNone -> 
+            // TODO: could this case + EffectEnded be handled more gracefully? Maybe return None?
             raise (InvalidOperationException "External completed with no value")
         | EffectFailed ex -> 
             raise ex
@@ -82,16 +83,17 @@ module Direct =
         | EffectPending ->
             // Should not happen after Await()
             raise (InvalidOperationException "Await returned Pending")
+        | EffectEnded -> raise (InvalidOperationException "External ended unexpectedly")
 
     let rec execute
             (env: ExecutionEnv)
             (prog: FlowProg<'T>) : EffectResult<'T> =
         match prog with
         | FPure th ->
-            try th() |> ValueSome |> EffectDone
+            try th() |> ValueSome |> EffectOutput
             with ex -> EffectFailed ex
         | FSync f ->
-            try f env |> ValueSome |> EffectDone
+            try f env |> ValueSome |> EffectOutput
             with ex -> EffectFailed ex
         | FExternal spec ->
             runExternal env spec
@@ -138,10 +140,10 @@ module Direct =
                 (* let a = execute env m.Program
                 let b = execute env (k a).Program *)
                 match execute env m.Program with
-                | EffectDone (ValueSome a) -> 
+                | EffectOutput (ValueSome a) -> 
                     match execute env (k a).Program with
-                    | EffectDone (ValueSome b) -> b
-                    | EffectDone ValueNone -> 
+                    | EffectOutput (ValueSome b) -> b
+                    | EffectOutput ValueNone -> 
                         raise (InvalidOperationException "Bind continuation completed with no value")
                     | EffectFailed ex -> 
                         raise ex
@@ -149,7 +151,9 @@ module Direct =
                         raise oce
                     | EffectPending -> 
                         raise (InvalidOperationException "Bind continuation returned Pending")
-                | EffectDone ValueNone -> 
+                    | EffectEnded ->
+                        raise (InvalidOperationException "Bind continuation returned Ended")
+                | EffectOutput ValueNone -> 
                     raise (InvalidOperationException "Bind continuation completed with no value")
                 | EffectFailed ex -> 
                     raise ex
@@ -157,6 +161,8 @@ module Direct =
                     raise oce
                 | EffectPending -> 
                     raise (InvalidOperationException "Bind continuation returned Pending")
+                | EffectEnded ->
+                    raise (InvalidOperationException "Bind continuation returned Ended")
             ) }
 
     (* let inline bind<'A,'B> (k: 'A -> Flow<'B>) (m: Flow<'A>) : Flow<'B> =
@@ -281,269 +287,13 @@ module Direct =
 
     module Lift =
 
-        let mutable private atomicCounter = 0 
-
-        let private tryWrap body =
-            try
-                body()
-            with
-            | :? AggregateException as ae ->
-                let ex =
-                    if isNull ae.InnerException then (ae :> exn)
-                    else ae.InnerException
-                EffectFailed ex
-            | :? OperationCanceledException as oce ->
-                EffectCancelled oce
-            | ex ->
-                EffectFailed ex
-
-        /// Lift a Task<'T> by eagerly wrapping as ExternalSpec.
-        let task(factory: unit -> Task<'T>) : ExternalSpec<'T> =
-            let spec =
-                { 
-                    Build = fun _ ->
-                        let mutable task = Unchecked.defaultof<Task<'T>>
-                        let started = new ManualResetEventSlim(false)                        
-                        
-                        { new ExternalHandle<'T> with
-                            member _.Id = Interlocked.Increment(&atomicCounter)
-                            member _.Class = EffectExternal "System.Threading.Tasks.Task"
-                            member _.IsStarted = started.IsSet
-                            member _.IsCompleted = 
-                                started.IsSet && not (isNull task) && task.IsCompleted
-
-                            member _.Start() =
-                                if not started.IsSet then
-                                    task <- factory()
-                                    started.Set()
-                                
-                                let token = BackendToken task
-                                { new EffectHandle<'T>(token) with
-                                    member _.IsCompleted = task.IsCompleted
-                                    
-                                    member _.Poll() =
-                                        if task.IsCompletedSuccessfully then 
-                                            EffectDone (ValueSome task.Result)
-                                        elif task.IsFaulted then 
-                                            let ex =
-                                                match task.Exception with
-                                                | null -> null
-                                                | ae when isNull ae.InnerException -> ae :> exn
-                                                | ae -> ae.InnerException
-                                            if isNull ex then EffectFailed (Exception())
-                                            else EffectFailed ex
-                                        elif task.IsCanceled then 
-                                            EffectCancelled (OperationCanceledException())
-                                        else EffectPending
-                                    
-                                    member this.Await() =
-                                        tryWrap (fun() -> 
-                                            task.Wait()
-                                            this.Poll()
-                                        )
-                                    
-                                    member this.AwaitTimeout ts = 
-                                        tryWrap (fun() ->
-                                            if task.Wait(ts) then 
-                                                this.Poll()
-                                            else 
-                                                EffectPending
-                                        )
-                                    
-                                    member _.Cancel() = () //TODO: actually cancel it?
-                                    member this.CancelWait() = this.Await()
-                                    member this.CancelWaitTimeout ts = this.AwaitTimeout ts
-                                }
-                            
-                            member _.Dispose() = 
-                                started.Dispose()
-                                if not (isNull task) then task.Dispose()
-                        }
-                    Classify = EffectExternal "Task"
-                    DebugLabel = Some "lift-task" 
-                }
-            in spec
-        
         /// Lift a Task<'T> into the Flow monad.
         let taskF(factory: unit -> Task<'T>) : Flow<'T> =
-            task factory |> externalSpec 
-
-        /// Lift Async<'T> by eagerly wrapping as ExternalSpec.
-        let async (comp: Async<'T>) : ExternalSpec<'T> =
-            let spec = { 
-                Build = fun _ ->
-                    let cts = new CancellationTokenSource()
-                    let started = new ManualResetEventSlim(false)
-                    let mutable task = Unchecked.defaultof<Task<'T>>
-                    
-                    { new ExternalHandle<'T> with
-                        member _.Id = Interlocked.Increment(&atomicCounter)
-                        member _.Class = EffectExternal "FSharp.Control.Async"
-                        member _.IsStarted = started.IsSet
-                        member _.IsCompleted = 
-                            started.IsSet && not (isNull task) && task.IsCompleted
-                        
-                        member _.Start() =
-                            if not started.IsSet then
-                                task <- Async.StartAsTask(comp, cancellationToken = cts.Token)
-                                started.Set()
-                            
-                            // Return handle to the RUNNING task
-                            { new EffectHandle<'T>(BackendToken task) with
-                                member _.IsCompleted = task.IsCompleted
-                                
-                                member _.Poll() =
-                                    if task.IsCompletedSuccessfully then
-                                        EffectDone (ValueSome task.Result)
-                                    elif task.IsFaulted then
-                                        let ex =
-                                            match task.Exception with
-                                            | null -> null
-                                            | ae when Object.ReferenceEquals(ae.InnerException, null) -> ae :> exn
-                                            | ae -> ae.InnerException
-                                        if isNull ex then EffectFailed (Exception())
-                                        else EffectFailed ex
-                                    elif task.IsCanceled then
-                                        EffectCancelled (OperationCanceledException())
-                                    else
-                                        EffectPending
-                                
-                                member this.Await() =
-                                    tryWrap (fun() -> 
-                                        task.Wait()
-                                        this.Poll()
-                                    )
-                                
-                                member this.AwaitTimeout ts =
-                                    tryWrap (fun() -> 
-                                        if task.Wait ts then this.Poll()
-                                        else EffectPending
-                                    )
-                                
-                                member _.Cancel() = cts.Cancel()
-                                
-                                member this.CancelWait() = 
-                                    cts.Cancel()
-                                    this.Await()
-                                
-                                member this.CancelWaitTimeout ts = 
-                                    cts.Cancel()
-                                    this.AwaitTimeout ts
-                            }
-                        
-                        member _.Dispose() = 
-                            started.Dispose()
-                            cts.Dispose()
-                            if not (isNull task) then task.Dispose()
-                    }
-                Classify = EffectExternal "Async"
-                DebugLabel = Some "lift-async" 
-            }
-            in spec
+            Flux.IO.Core.Lift.task factory |> externalSpec 
 
         /// Lift and Async<'T> into the Flow monad.        
-        let asyncF (comp: Async<'T>) : Flow<'T> = async comp |> externalSpec
-
-        /// Start (build + start) an ExternalSpec returning the raw EffectHandle<'T> without awaiting completion.
-        /// This is synchronous and allocation-light: it executes only the builder and Start().
-        let effectHandle (spec: ExternalSpec<'T>) : Flow<EffectHandle<'T>> =
-            { Program =
-                FSync (fun env ->
-                    let h = spec.Build env
-                    if h.IsStarted then invalidOp "External effect already started."
-                    let handle = h.Start() // side effect: effect starts
-                    // NOTE: ExternalHandle 'h' is not disposed automatically here.
-                    // TODO: Consider wrapping handle to dispose 'h' after completion (Phase 2).
-                    handle
-                )
-            }
-
-        let buildHandle<'T>
-                (factory: unit -> Task<'T>) 
-                (cleanup: unit -> unit)
-                (cancellation: unit -> unit)
-                (env: ExecutionEnv) : ExternalHandle<'T> =
-            let mutable taskRef : Task<'T> = Unchecked.defaultof<_>
-            let started = new ManualResetEventSlim(false)
-            { new ExternalHandle<'T> with
-                member _.Id = Interlocked.Increment(&atomicCounter)
-                member _.Class = EffectExternal typeof<Task<'T>>.FullName
-                member _.IsStarted = started.IsSet
-                member _.IsCompleted = started.IsSet && not (isNull taskRef) && taskRef.IsCompleted
-                member _.Start() =
-                    if not started.IsSet then
-                        taskRef <- factory()
-                        started.Set()
-                    { new EffectHandle<'T>(BackendToken taskRef) with
-                        member _.IsCompleted = taskRef.IsCompleted
-                        member _.Poll() =
-                            if taskRef.IsCompletedSuccessfully then EffectDone (ValueSome taskRef.Result)
-                            elif taskRef.IsFaulted then
-                                let ex =
-                                    match taskRef.Exception with
-                                    | null -> null
-                                    | ae when isNull ae.InnerException -> ae :> exn
-                                    | ae -> ae.InnerException
-                                if isNull ex then EffectFailed (Exception())
-                                else EffectFailed ex
-                            elif taskRef.IsCanceled then EffectCancelled (OperationCanceledException())
-                            else EffectPending
-                        member this.Await() =
-                            taskRef.Wait()
-                            this.Poll()
-                        member this.AwaitTimeout ts =
-                            if taskRef.Wait ts then this.Poll() else EffectPending
-                        member _.Cancel() = cancellation()
-                        member this.CancelWait() = 
-                            this.Cancel()
-                            this.Await()
-                        member this.CancelWaitTimeout ts = 
-                            this.Cancel()
-                            this.AwaitTimeout ts
-                    }
-                member _.Dispose() =
-                    started.Dispose()
-                    if not (isNull taskRef) then taskRef.Dispose()
-                    cleanup()
-            }
-
-        let buildTaskHandle<'T>
-                (factory: unit -> Task<'T>) 
-                (env: ExecutionEnv) : ExternalHandle<'T> =
-            buildHandle factory id id env
-
-        let buildAsyncHandle<'T>
-                (comp: Async<'T>) 
-                (env: ExecutionEnv) : ExternalHandle<'T> = 
-            // Delegate to existing async adapter but intercept before blocking
-            let cts = new CancellationTokenSource()
-            buildHandle 
-                (fun () -> Async.StartAsTask(comp, cancellationToken = cts.Token)) 
-                (fun () -> cts.Cancel())
-                (fun () -> cts.Dispose())
-                env
-
-        /// Non-blocking start for a Task-producing factories.
-        let taskHandle (factory: unit -> Task<'T>) : Flow<EffectHandle<'T>> =
-            // 'task' currently blocks (awaits). We need a fresh spec that does NOT block.
-            // Provide a minimal spec replicating the logic but returning handle directly.
-            let spec =
-                {
-                    Build = buildTaskHandle factory
-                    Classify = EffectExternal "Task"
-                    DebugLabel = Some "task-handle"
-                }
-            in effectHandle spec
-
-        /// Non-blocking start for Async<'T> work.
-        let asyncHandle (comp: Async<'T>) : Flow<EffectHandle<'T>> =
-            let spec =
-                {
-                    Build = buildAsyncHandle comp
-                    Classify = EffectExternal "Async"
-                    DebugLabel = Some "async-handle"
-                }
-            in effectHandle spec
+        let asyncF (comp: Async<'T>) : Flow<'T> = 
+            Flux.IO.Core.Lift.async comp |> externalSpec
 
     (* Intermediary module: offload + later emission (Phase 1 refactoring) *)
 
@@ -684,10 +434,11 @@ module Direct =
                         let h = spec.Build env
                         let eh = h.Start()
                         match eh.Await() with
-                        | EffectDone (ValueSome v) -> v
+                        | EffectOutput (ValueSome v) -> v
+                        | EffectEnded -> raise (InvalidOperationException "External ended unexpectedly")
                         | EffectFailed ex -> raise ex
                         | EffectCancelled oce -> raise oce
-                        | EffectDone ValueNone -> raise (InvalidOperationException "External returned no value")
+                        | EffectOutput ValueNone -> raise (InvalidOperationException "External returned no value")
                         | EffectPending -> raise (InvalidOperationException "Unexpected pending external")
                     | FDelay th -> run env (th())
                     | FTryWith (b,h) ->
@@ -758,7 +509,7 @@ module Direct =
                             { e0 with Attrs = newAttrs })
 
                     // Keep if not complete
-                    if not isComplete then true, drainedEnvelopes else false, drainedEnvelopes
+                    not isComplete , drainedEnvelopes
 
         (* Drain all outlets respecting batch max.  Returns (survivors, drained envelopes). *)
         let private drainAll
@@ -863,7 +614,7 @@ module Direct =
                                     let h = spec.Build env
                                     let ah = h.Start()
                                     match ah.Await() with
-                                    | EffectDone (ValueSome v) -> v
+                                    | EffectOutput (ValueSome v) -> v
                                     | EffectFailed ex -> raise ex
                                     | EffectCancelled oce -> raise oce
                                     | _ -> failwith "Unexpected pending external in forkSingle fallback path."
@@ -887,7 +638,7 @@ module Direct =
                             match res with
                             | EffectPending ->
                                 Consume
-                            | EffectDone (ValueSome value) ->
+                            | EffectOutput (ValueSome value) ->
                                 let latencyMs = execEnv.NowUnix() - startedAt
                                 let outPayload = project orig value
                                 let baseEnv = mapPayload outPayload orig
@@ -900,13 +651,17 @@ module Direct =
                                     }
                                 state <- Idle
                                 Emit outEnv
+                            | EffectEnded ->
+                                // TODO: FIXME: this fork will move out of direct soon anyway!!!
+                                state <- Idle
+                                Complete
                             | EffectFailed ex ->
                                 state <- Faulted ex
                                 Error ex
                             | EffectCancelled oce ->
                                 state <- Faulted oce
                                 Error oce
-                            | EffectDone ValueNone ->
+                            | EffectOutput ValueNone ->
                                 // TODO: Consider treating as protocol error
                                 state <- Faulted (InvalidOperationException "Effect completed without value.")
                                 Error (InvalidOperationException "Empty effect result")
@@ -944,11 +699,12 @@ module Direct =
                                     let h = spec.Build env
                                     let eh = h.Start()
                                     match eh.Await() with
-                                    | EffectDone (ValueSome v) -> v
+                                    | EffectOutput (ValueSome v) -> v
                                     | EffectFailed ex -> raise ex
                                     | EffectCancelled oce -> raise oce
-                                    | EffectDone ValueNone -> raise (InvalidOperationException "No value")
+                                    | EffectOutput ValueNone -> raise (InvalidOperationException "No value")
                                     | EffectPending -> raise (InvalidOperationException "Pending external")
+                                    | EffectEnded -> raise (InvalidOperationException "External ended unexpectedly")
                                 | FDelay th -> run env (th())
                                 | FTryWith (b,h) -> try run env b with ex -> run env (h ex)
                                 | FTryFinally (b,fin) ->
@@ -967,7 +723,7 @@ module Direct =
         let forkAsyncSingle
                 (work : 'In -> Async<'Out>) : StreamProcessor<'In,'Out> =
             forkSingle
-                (fun input -> Lift.asyncHandle (work input))
+                (fun input -> Flux.IO.Core.Lift.asyncHandle (work input))
                 (fun _ v -> v)
 
         /// Starts an Async<'Out> thunk, obtains an EffectHandle<'Out>, then adapts it to an outlet.
@@ -979,7 +735,7 @@ module Direct =
             // Build: 'startOutlet : 'In -> Flow<IEffectOutlet<'Out>>
             forkOutlet cfg (fun input ->
                 // Flow<EffectHandle<'Out>>
-                let handleFlow = Lift.asyncHandle (work input)
+                let handleFlow = Flux.IO.Core.Lift.asyncHandle (work input)
                 { Program =
                     FSync (fun env ->
                         // Local minimal interpreter returning EffectHandle<'Out>
@@ -1013,9 +769,11 @@ module Direct =
                                         // Very short spin; for direct path we accept blocking
                                         Thread.SpinWait 40
                                         awaitOuter()
-                                    | EffectDone (ValueSome inner) -> inner
-                                    | EffectDone ValueNone ->
+                                    | EffectOutput (ValueSome inner) -> inner
+                                    | EffectOutput ValueNone ->
                                         raise (InvalidOperationException "External handle produced no inner handle")
+                                    | EffectEnded ->
+                                        raise (InvalidOperationException "External handle ended unexpectedly")
                                     | EffectFailed ex -> raise ex
                                     | EffectCancelled oce -> raise oce
                                 awaitOuter()
@@ -1051,7 +809,7 @@ module Direct =
                                     Async.StartWithContinuations(
                                         comp,
                                         (fun value -> 
-                                            result <- EffectDone (ValueSome value)
+                                            result <- EffectOutput (ValueSome value)
                                             completed.Set()
                                         ),
                                         (fun ex -> 
@@ -1169,7 +927,7 @@ module Direct =
                 Async.StartWithContinuations(
                     asyncWork,
                     (fun value -> 
-                        result <- EffectDone (ValueSome value)
+                        result <- EffectOutput (ValueSome value)
                         completed.Set()
                     ),
                     (fun ex -> 
@@ -1212,7 +970,7 @@ module Direct =
                 
                 // Try to get result within timeout
                 match started.AwaitTimeout timeout with
-                | EffectDone (ValueSome value) -> 
+                | EffectOutput (ValueSome value) -> 
                     return Choice1Of2 value
                 | EffectFailed ex -> 
                     return raise ex
@@ -1229,7 +987,7 @@ module Direct =
                 (started: StartedAsync<'T>) : Async<Choice<'T, StartedAsync<'T>>> =
             async {
                 match started.AwaitTimeout timeout with
-                | EffectDone (ValueSome value) -> 
+                | EffectOutput (ValueSome value) -> 
                     return Choice1Of2 value
                 | EffectFailed ex -> 
                     return raise ex
@@ -1290,7 +1048,7 @@ module Direct =
                     |> Array.map (fun started ->
                         async {
                             match started.AwaitTimeout timeout with
-                            | EffectDone (ValueSome value) -> return (Some value, started)
+                            | EffectOutput (ValueSome value) -> return (Some value, started)
                             | _ -> return (None, started)
                         }
                     )

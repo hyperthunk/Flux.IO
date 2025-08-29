@@ -85,11 +85,12 @@ module Outlets =
 
     /// Abstract outlet surface
     type EffectOutlet<'T> =
-        abstract Kind        : OutletKind
-        abstract TryDequeue  : unit -> 'T voption      // Single item if available
-        abstract IsCompleted : bool
-        abstract Error       : exn option
-        abstract Dispose     : unit -> unit
+        abstract Kind          : OutletKind
+        abstract TryDequeue    : unit -> 'T voption      // Single item if available
+        abstract AwaitActivity : TimeSpan -> bool 
+        abstract IsCompleted   : bool
+        abstract Error         : exn option
+        abstract Dispose       : unit -> unit
 
     /// Wrap a single EffectHandle<'T> as an outlet.
     type internal SingleValueOutlet<'T>(handle: EffectHandle<'T>) =
@@ -107,11 +108,11 @@ module Outlets =
                     if not completed then
                         match handle.Poll() with
                         | EffectPending -> ValueNone
-                        | EffectDone (ValueSome v) ->
+                        | EffectOutput (ValueSome v) ->
                             completed <- true
                             stored <- Some v
                             ValueSome v
-                        | EffectDone ValueNone ->
+                        | EffectOutput ValueNone ->
                             completed <- true
                             error <- Some (InvalidOperationException "Effect returned no value.")
                             ValueNone
@@ -123,12 +124,17 @@ module Outlets =
                             completed <- true
                             error <- Some ex
                             ValueNone
+                        | EffectEnded ->
+                            completed <- true
+                            error <- Some (InvalidOperationException "Effect ended unexpectedly.")
+                            ValueNone
                     else
                         match stored with
                         | Some v when not consumedOnce ->
                             consumedOnce <- true
                             ValueSome v
                         | _ -> ValueNone
+            member _.AwaitActivity timeout = failwith "Not implemented"
             member _.IsCompleted = completed && (stored.IsSome || error.IsSome)
             member _.Error = error
             member _.Dispose () = () // Underlying handle disposal TBD Phase 3 (wrapping ExternalHandle)
@@ -162,6 +168,7 @@ module Outlets =
                 match queue.TryDequeue() with
                 | true, v -> ValueSome v
                 | _ -> ValueNone
+            member _.AwaitActivity timeout = failwith "Not implemented"
             member _.IsCompleted =
                 completed && queue.IsEmpty
             member _.Error = error

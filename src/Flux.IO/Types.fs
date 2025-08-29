@@ -116,11 +116,23 @@ type StageKind =
     | Merge
     | Sink
 
+(* 
+type EquinoxClass =
+    | Equinox
+    | Propulsion
+*)
+
 type EffectClass =
     | EffectIO
     | EffectCPU
     | EffectTimer
+    (* built-in effect classes *)
+    | EffectAsync
+    | EffectTask
+    | EffectHopac
+    | EffectTPL
     | EffectExternal of string
+    (* | EffectEquinox of EquinoxClass *)
 
 type BackendToken<'a> = BackendToken of obj
 
@@ -150,6 +162,18 @@ type Either<'L, 'R> =
         | Left l  -> ValueNone
         | Neither -> ValueNone
 
+    member this.LeftOrDefault def =
+        match this with
+        | Left l -> l
+        | Right _ -> def
+        | Neither -> def
+
+    member this.RightOrDefault def =
+        match this with
+        | Right r -> r
+        | Left _  -> def
+        | Neither -> def
+
     static member map (f: 'L -> 'U) (e: Either<'L,'R>) : Either<'U,'R> =
         match e with
         | Left l -> Left (f l)
@@ -170,18 +194,20 @@ type Either<'L, 'R> =
 
 [<Struct>]
 type EffectResult<'a> =
-    | EffectDone      of result: 'a voption
+    | EffectOutput    of result: 'a voption
     | EffectFailed    of reason: exn
     | EffectCancelled of reason: exn
+    | EffectEnded
     | EffectPending with 
         
         member this.Result = 
             match this with
-            | EffectPending -> raise (InvalidOperationException "Effect is still pending")
-            | EffectDone (ValueSome result) -> Left result
-            | EffectDone ValueNone -> Neither
+            | EffectOutput (ValueSome result) -> Left result
+            | EffectEnded -> Neither
+            | EffectOutput ValueNone -> Neither
             | EffectFailed ex -> Right ex
             | EffectCancelled ex -> Right ex
+            | EffectPending -> raise (InvalidOperationException "Effect is still pending")
 
         member this.IsCompleted = 
             match this with
@@ -200,11 +226,8 @@ type EffectResult<'a> =
 module EffectResult =
     let inline map ([<InlineIfLambda>] mapping) result =
         match result with
-        | EffectFailed e -> EffectFailed e
-        | EffectDone (ValueSome x) -> EffectDone (ValueSome (mapping x))
-        | EffectDone ValueNone -> EffectDone ValueNone
-        | EffectCancelled e -> EffectCancelled e
-        | EffectPending -> EffectPending
+        | EffectOutput (ValueSome x) -> EffectOutput (ValueSome (mapping x))
+        | _ -> result
 
     let inline mapResult ([<InlineIfLambda>] mapping) result =
         Either.map mapping result
@@ -212,21 +235,18 @@ module EffectResult =
     let inline mapError ([<InlineIfLambda>] mapping) result =
         match result with
         | EffectFailed e -> EffectFailed (mapping e)
-        | EffectDone (ValueSome x) -> EffectDone (ValueSome x)
-        | EffectDone ValueNone -> EffectDone ValueNone
-        | EffectCancelled e -> EffectCancelled e
-        | EffectPending -> EffectPending
+        | _ -> result
 
     let inline bind ([<InlineIfLambda>] binder) result =
         map binder result
     
-    let inline pure' x = EffectDone (ValueSome x)
+    let inline pure' x = EffectOutput (ValueSome x)
 
     let ret = pure'
 
     let inline unwrap (result: EffectResult<'a>) : 'a =
         match result with
-        | EffectDone (ValueSome x) -> x
+        | EffectOutput (ValueSome x) -> x
         | _ -> raise (InvalidOperationException "Effect does not produce a value")
 
 [<AbstractClass>]
@@ -362,3 +382,7 @@ module Core =
     open FSharpPlus
 
     let inline flip f x y = FSharpPlus.Operators.flip f x y
+
+    let invalidOp msg = 
+        let ex = InvalidOperationException msg
+        raise ex

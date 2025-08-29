@@ -99,8 +99,8 @@ module IntermediaryModelTests =
                     member _.Poll() =
                         match state with
                         | Pending -> EffectPending
-                        | Success v -> EffectDone (ValueSome v)
-                        | SuccessNone -> EffectDone ValueNone
+                        | Success v -> EffectOutput (ValueSome v)
+                        | SuccessNone -> EffectOutput ValueNone
                         | Failure ex -> EffectFailed ex
                         | Cancelled ex -> EffectCancelled ex
                     member this.Await() = this.Poll()
@@ -143,11 +143,11 @@ module IntermediaryModelTests =
                 let proc, setOutcome =
                     mkProcessor (fun e v -> e.Payload + v)
                 match step env proc envIn with
-                | EffectDone (ValueSome Consume) ->
+                | EffectOutput (ValueSome Consume) ->
                     setOutcome (Success input)
                     now := 1017L
                     match step env proc envIn with
-                    | EffectDone (ValueSome (Emit outEnv)) ->
+                    | EffectOutput (ValueSome (Emit outEnv)) ->
                         let payloadOK = outEnv.Payload = input * 2
                         let hasLatency = outEnv.Attrs |> HashMap.tryFind EnvelopeAttributeKeys.ForkLatency |> ValueOption.isSome
                         let hasId = outEnv.Attrs |> HashMap.tryFind EnvelopeAttributeKeys.ForkId |> ValueOption.isSome
@@ -167,7 +167,7 @@ module IntermediaryModelTests =
             let r2 = step env proc envIn
             let isErr r =
                 match r with
-                | EffectDone (ValueSome (Error e)) when obj.ReferenceEquals(e, ex) -> true
+                | EffectOutput (ValueSome (Error e)) when obj.ReferenceEquals(e, ex) -> true
                 | _ -> false
             (isErr r1 && isErr r2) |> Prop.ofTestable
 
@@ -180,7 +180,7 @@ module IntermediaryModelTests =
             setOutcome (Cancelled (OperationCanceledException "cx" :> exn))
             let res = 
                 match step env proc envIn with
-                | EffectDone (ValueSome (Error e)) ->
+                | EffectOutput (ValueSome (Error e)) ->
                     match e with
                     | :? OperationCanceledException -> true
                     | _ -> false
@@ -195,7 +195,7 @@ module IntermediaryModelTests =
             let _ = step env proc envIn
             setOutcome SuccessNone
             match step env proc envIn with
-            | EffectDone (ValueSome (Error ex)) when ex.Message.Contains "Empty effect" -> true
+            | EffectOutput (ValueSome (Error ex)) when ex.Message.Contains "Empty effect" -> true
             | _ -> false
             |> Prop.ofTestable
 
@@ -215,7 +215,7 @@ module IntermediaryModelTests =
             let _ = run env (StreamProcessor.runProcessor proc envIn)
             hOpt.Value.Set (Success 7)
             match run env (StreamProcessor.runProcessor proc envIn) with
-            | EffectDone (ValueSome (Emit outEnv)) -> outEnv.Payload = 70
+            | EffectOutput (ValueSome (Emit outEnv)) -> outEnv.Payload = 70
             | _ -> false
             |> Prop.ofTestable
 
@@ -240,6 +240,7 @@ module IntermediaryModelTests =
                 member _.TryDequeue() =
                     if q.Count = 0 then ValueNone
                     else ValueSome (q.Dequeue())
+                member _.AwaitActivity timeout = failwith "Not implemented"
                 member _.IsCompleted = completed && q.Count = 0
                 member _.Error = error
                 member _.Dispose() = ()
@@ -261,8 +262,8 @@ module IntermediaryModelTests =
 
         let capture env proc envIn =
             match run env (StreamProcessor.runProcessor proc envIn) with
-            | EffectDone (ValueSome (Emit e)) -> [e]
-            | EffectDone (ValueSome (EmitMany es)) -> es
+            | EffectOutput (ValueSome (Emit e)) -> [e]
+            | EffectOutput (ValueSome (EmitMany es)) -> es
             | _ -> []
 
         let runScript cfg script =
@@ -349,7 +350,7 @@ module IntermediaryModelTests =
             let proc = forkOutlet cfg startOutlet
             let envIn = Envelope.create 0L ()
             match run env (StreamProcessor.runProcessor proc envIn) with
-            | EffectDone (ValueSome (Error ex)) when ex.Message = "boom" -> true
+            | EffectOutput (ValueSome (Error ex)) when ex.Message = "boom" -> true
             | _ -> false
             |> Prop.ofTestable
 
@@ -384,7 +385,7 @@ module IntermediaryModelTests =
 
             // Kick the outlet (non-blocking). Expect Consume or an early Emit.
             match run env (StreamProcessor.runProcessor proc envIn) with
-            | EffectDone (ValueSome (Emit e)) ->
+            | EffectOutput (ValueSome (Emit e)) ->
                 // Fast-path: if it was already done (rare), assert and finish
                 (e.Payload = 10) |> Prop.ofTestable
             | _ ->
@@ -394,9 +395,9 @@ module IntermediaryModelTests =
 
                 // Drain: this call should NOT start a new async (guarded by SeqId), only drain existing
                 match run env (StreamProcessor.runProcessor proc envIn) with
-                | EffectDone (ValueSome (Emit e)) ->
+                | EffectOutput (ValueSome (Emit e)) ->
                     (e.Payload = 10) |> Prop.ofTestable
-                | EffectDone (ValueSome (EmitMany es)) ->
+                | EffectOutput (ValueSome (EmitMany es)) ->
                     (es |> List.exists (fun e -> e.Payload = 10)) |> Prop.ofTestable
                 | other ->
                     false |> Prop.label (sprintf "Expected Emit after completion, got %A" other)
