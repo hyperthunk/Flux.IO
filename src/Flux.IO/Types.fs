@@ -3,6 +3,7 @@ namespace Flux.IO.Core.Types
 open FSharp.Control
 open FSharp.HashCollections
 open System
+open System.Collections
 open System.Threading
 
 type Timestamp = int64
@@ -39,6 +40,7 @@ type Attribute =
     | AttrList of Attribute list
     | AttrObj of obj
 
+[<CustomEquality; CustomComparison>]
 type Envelope<'T> = { 
     Payload : 'T
     Headers : HashMap<string,string>
@@ -85,7 +87,48 @@ type Envelope<'T> = {
             |> Seq.fold (fun acc (k,v) -> FSharp.HashCollections.HashMap.add k v acc) e.Attrs
         { e with Attrs = merged }
 
-module EnvelopeAttributeKeys =
+    override this.GetHashCode() =
+        this.SeqId.GetHashCode() ^^^ 
+        this.Ts.GetHashCode() ^^^ 
+        this.SpanCtx.GetHashCode() ^^^
+        HashIdentity.Reference.GetHashCode (box this.Payload)
+
+    interface IEquatable<Envelope<'T>> with
+        member this.Equals(other: Envelope<'T>) =
+            this.SeqId = other.SeqId &&
+            this.Ts = other.Ts &&
+            this.SpanCtx = other.SpanCtx &&
+            Object.Equals(this.Payload, other.Payload)
+
+    interface IStructuralComparable with
+        member this.CompareTo(other: obj, comparer: IComparer) =
+            match other with
+            | :? Envelope<'T> as env ->
+                let c = compare this.SeqId env.SeqId
+                if c <> 0 then c else
+                let c = compare this.Ts env.Ts
+                if c <> 0 then c else
+                let c = compare this.SpanCtx.SpanId env.SpanCtx.SpanId
+                if c <> 0 then c else
+                let c = compare this.SpanCtx.TraceId env.SpanCtx.TraceId
+                if c <> 0 then c else
+                comparer.Compare(box this.Payload, box env.Payload)
+            | _ -> 0
+
+    member this.EqualTo(other: Envelope<'T>) =
+        (this :> IEquatable<Envelope<'T>>).Equals other
+
+    override this.Equals (obj: obj): bool = 
+        let other = 
+            match obj with
+            | :? Envelope<'T> as env -> Some env
+            | _ -> None
+        Option.map this.EqualTo other
+        |> Option.defaultValue false
+
+module Envelope =
+    open System.Collections.Generic
+
     [<Literal>] 
     let ForkLatency    = "fork.latencyMs"
     [<Literal>] 
@@ -98,6 +141,17 @@ module EnvelopeAttributeKeys =
     let OutletError    = "outlet.error"
     [<Literal>] 
     let OutletComplete = "outlet.complete"
+
+    let EnvelopeComparer<'T> =
+        HashIdentity.FromFunctions
+            (fun (x: Envelope<'T>) -> x.GetHashCode())
+            (fun (x: Envelope<'T>) (y: Envelope<'T>) -> (x :> IEquatable<Envelope<'T>>).Equals y)
+
+    type EnvelopeComparerT<'T> =
+        struct end
+        interface IEqualityComparer<Envelope<'T>> with
+            member this.GetHashCode (x: Envelope<'T>) = EnvelopeComparer.GetHashCode x
+            member this.Equals (x: Envelope<'T>, y: Envelope<'T>) = EnvelopeComparer.Equals (x, y)
 
 type Batch<'T> = 
     {
@@ -340,12 +394,63 @@ type ExternalSpec<'T> =
     }
 
 // Stream command DU (reused by pipeline processors)
+[<CustomEquality; CustomComparison>]
 type StreamCommand<'T> =
     | Emit of Envelope<'T>
     | EmitMany of Envelope<'T> list
     | Consume
     | Complete
-    | Error of exn
+    | Error of exn 
+    with
+        override this.GetHashCode() =
+            match this with
+            | Emit env -> HashIdentity.Reference.GetHashCode (box env)
+            | EmitMany envs -> List.map HashIdentity.Reference.GetHashCode envs |> List.fold (^^^) 0
+            | Consume -> 0
+            | Complete -> -1
+            | Error exn -> HashIdentity.Reference.GetHashCode (box exn)
+
+        interface IEquatable<StreamCommand<'T>> with
+            member this.Equals(other: StreamCommand<'T>) =
+                match this, other with
+                | Emit env1, Emit env2 -> env1 = env2
+                | EmitMany envs1, EmitMany envs2 -> envs1 = envs2
+                | Consume, Consume -> true
+                | Complete, Complete -> true
+                | Error exn1, Error exn2 -> exn1 = exn2
+                | _ -> false
+
+        interface IStructuralComparable with
+            member this.CompareTo(other: obj, comparer: IComparer) =
+                match other with
+                | :? StreamCommand<'T> as cmd ->
+                    compare this cmd
+                | _ -> 0
+
+        member this.EqualTo(other: StreamCommand<'T>) =
+            (this :> IEquatable<StreamCommand<'T>>).Equals other
+
+        override this.Equals (obj: obj): bool = 
+            let other = 
+                match obj with
+                | :? StreamCommand<'T> as cmd -> Some cmd
+                | _ -> None
+            Option.map this.EqualTo other
+            |> Option.defaultValue false
+
+module StreamCommand =
+    open System.Collections.Generic
+
+    let StreamCommandComparer<'T> =
+        HashIdentity.FromFunctions
+            (fun (x: StreamCommand<'T>) -> x.GetHashCode())
+            (fun (x: StreamCommand<'T>) (y: StreamCommand<'T>) -> (x :> IEquatable<StreamCommand<'T>>).Equals y)
+
+    type StreamCommandComparerT<'T> =
+        struct end
+        interface IEqualityComparer<StreamCommand<'T>> with
+            member this.GetHashCode (x: StreamCommand<'T>) = StreamCommandComparer.GetHashCode x
+            member this.Equals (x: StreamCommand<'T>, y: StreamCommand<'T>) = StreamCommandComparer.Equals (x, y)
 
 (* 
     Direct Flow Program Representation

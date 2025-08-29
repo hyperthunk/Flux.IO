@@ -185,6 +185,7 @@ module Async =
                     if workerToken.IsCancellationRequested then
                         raise (OperationCanceledException())
                     else
+                        printfn "Posting %A" item
                         mbox.Post (Enqueue (EffectOutput (ValueSome item)))
                 (* while hEnum.MoveNextAsync().AsTask().Result && 
                       not workerToken.IsCancellationRequested do

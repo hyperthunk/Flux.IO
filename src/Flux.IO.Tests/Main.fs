@@ -11,6 +11,7 @@ module TestRunner =
     open Flux.IO.Tests.CoreStreamingMaterializeTests
     open Flux.IO.Tests.CoreIntegrationTestSuite
     open Flux.IO.Tests.IntermediaryModelTests
+    open Flux.IO.Tests.ExternalHandleTests.Tests
     // open Flux.IO.Tests.CoreStreamProcessingTests
 
     [<EntryPoint>]
@@ -26,6 +27,7 @@ module TestRunner =
             coreTests
             intermediaryTests
             CoreMachine.streamProcessorModelTests
+            externalHandleTests
         ]
 
         allTests

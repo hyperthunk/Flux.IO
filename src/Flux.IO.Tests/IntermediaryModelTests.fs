@@ -149,8 +149,8 @@ module IntermediaryModelTests =
                     match step env proc envIn with
                     | EffectOutput (ValueSome (Emit outEnv)) ->
                         let payloadOK = outEnv.Payload = input * 2
-                        let hasLatency = outEnv.Attrs |> HashMap.tryFind EnvelopeAttributeKeys.ForkLatency |> ValueOption.isSome
-                        let hasId = outEnv.Attrs |> HashMap.tryFind EnvelopeAttributeKeys.ForkId |> ValueOption.isSome
+                        let hasLatency = outEnv.Attrs |> HashMap.tryFind Envelope.ForkLatency |> ValueOption.isSome
+                        let hasId = outEnv.Attrs |> HashMap.tryFind Envelope.ForkId |> ValueOption.isSome
                         (payloadOK && hasLatency && hasId) |> Prop.label "success path"
                     | other -> false |> Prop.label (sprintf "unexpected %A" other)
                 | other -> false |> Prop.label (sprintf "expected Consume, got %A" other))

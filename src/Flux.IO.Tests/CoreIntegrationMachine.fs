@@ -154,7 +154,7 @@ module CoreIntegrationMachine =
         | RChunk  of ChunkPipeline  * ChunkRuntimeState
 
     type Sut() =
-        let pipelines = System.Collections.Concurrent.ConcurrentDictionary<int, RuntimePipeline>()
+        let pipelines = Collections.Concurrent.ConcurrentDictionary<int, RuntimePipeline>()
         let ctx = mkExecContext()
 
         member _.Pipelines = pipelines
