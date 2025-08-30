@@ -1,5 +1,4 @@
 // copy of https://github.com/fsprojects/FSharpx.Collections/blob/master/src/FSharpx.Collections.Experimental/RealTimeDeque.fs
-// will revert to library dependency if use is positive
 
 //originally published by Julien
 // original implementation taken from http://lepensemoi.free.fr/index.php/2010/02/05/real-time-double-ended-queue
@@ -8,6 +7,29 @@
 //   -- added standardized C of 2 for singleton, empty, and ofSeq based on my reading of Okasaki
 
 //pattern discriminators Cons, Snoc, and Nil
+
+(*
+    Flux.IO ChangeLog..
+
+    Our use of this collection hits a certain point of fragility: 
+    `check`’s rotation uses `LazyList.take c r`, which throws when n > length. 
+    
+    Under heavy front/very small back (precisely the rebalance trigger case), 
+    r can be shorter than c (2), so take raises “not enough items in the list”.
+    
+    + Changes to support robust behaviour under "bursty" usage patterns.
+
+    Rotation now treats r as a possibly short stream and only consumes up 
+    to c items per step. 
+    
+    When r runs out (common with fast front, tiny back), takeAtMost returns 
+    empty instead of throwing, and the algorithm proceeds to drain f while 
+    accumulating the already-consumed suffix in a.
+    
+    Now `check2` remains mathematically safe because each branch only takes 
+    from the larger side (≥ n/2), so take i (front) or take j (back) won’t overrun.
+
+*)
 
 namespace Flux.IO.Internal
 
