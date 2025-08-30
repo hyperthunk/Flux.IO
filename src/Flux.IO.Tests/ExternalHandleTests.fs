@@ -123,7 +123,7 @@ module ExternalHandleTests =
             gen {
                 let! a = Gen.choose(5, 100)
                 let! b = Gen.choose(2, 10)
-                let! c = Gen.choose(100, 149)
+                let! c = Gen.choose(20, 149)
                 return (a, b, c)
             }
 
@@ -138,7 +138,7 @@ module ExternalHandleTests =
 
         [<Tests>]
         let externalHandleTests =
-            testList "External Handle Tests" [
+            ftestList "External Handle Tests" [
                 testPropertyWithConfig 
                         { FsCheckConfig.defaultConfig with maxTest = 10 }
                         "Async Seq Handle With Bursty Producer" <| fun () ->

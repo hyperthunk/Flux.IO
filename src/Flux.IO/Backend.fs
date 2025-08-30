@@ -139,7 +139,7 @@ module Async =
             | Choice2Of3 tcs, _ -> tcs.SetResult msg; state
             // TODO: EffectEnded with waiting readers...
             | Choice3Of3 rc, EffectPending -> 
-                printfn "EffectPending with 'BlockingDequeue': storing reader %d" state.NextWaiterID
+                // printfn "EffectPending with 'BlockingDequeue': storing reader %d" state.NextWaiterID
                 { state with 
                     WaitingReaders = Deque.snoc (AsyncWaiter (rc, state.NextWaiterID)) state.WaitingReaders
                     NextWaiterID = state.NextWaiterID + 1
@@ -148,7 +148,7 @@ module Async =
                 match Deque.tryUncons state.WaitingReaders with
                 | Some (AsyncWaiter (rc2, id), t) -> 
                     // we have a pending reader - satisfy it first
-                    printfn "Satisfying pending Async reader %d" id
+                    // printfn "Satisfying pending Async reader %d" id
                     rc2.Reply effect
                     { state with 
                         WaitingReaders = Deque.snoc (AsyncWaiter (rc, state.NextWaiterID)) t 
@@ -156,7 +156,7 @@ module Async =
                     }
                 | Some (TaskWaiter (tcs, id), t) ->
                     // we have a pending TaskCompletionSource
-                    printfn "Satisfying pending Task reader %d" id
+                    // printfn "Satisfying pending Task reader %d" id
                     tcs.SetResult effect
                     { state with 
                         WaitingReaders = Deque.snoc (AsyncWaiter (rc, state.NextWaiterID)) t 
@@ -164,12 +164,12 @@ module Async =
                     }
                 | None ->
                     // no pending readers, so we write to the current blocking channel
-                    printfn "No pending readers, replying to BlockingDequeue directly"
+                    // printfn "No pending readers, replying to BlockingDequeue directly"
                     rc.Reply effect
                     state
         in if cont then drainReaders state' msg else state'
     and internal drainReaders state msg =
-        printfn "Draining readers with state: %A" state
+        // printfn "Draining readers with state: %A" state
         match Deque.tryUncons state.WaitingReaders with
         | Some (AsyncWaiter (rc, _), t) ->
             dispatch { state with WaitingReaders = t } (Choice1Of3 rc) msg true
@@ -185,17 +185,17 @@ module Async =
                                 TaskCompletionSource<EffectResult<'t>>,
                                 AsyncReplyChannel<EffectResult<'t>>>) =
 
-        printfn "Trying to dequeue with state: %A, reply: %A" state chReply
+        // printfn "Trying to dequeue with state: %A, reply: %A" state chReply
         match Deque.tryUncons state.Queue with
         | None -> 
-            printfn "Dequeue: state.Queue empty (EffectPending)"
+            // printfn "Dequeue: state.Queue empty (EffectPending)"
             reply state chReply EffectPending |> Left
         | Some (Left v, t) ->
-            printfn "Dequeued: %A (from state.Queue)" v
+            // printfn "Dequeued: %A (from state.Queue)" v
             reply state chReply v |> fun s -> Left { s with Queue = t }
         | Some (Right WriterStopped, t) ->
             if Deque.isEmpty t then
-                printfn "Dequeued (WriterStopped): %A" WriterStopped
+                // printfn "Dequeued (WriterStopped): %A" WriterStopped
                 // if we drained the mailbox prior to receiving this, we can shutdown
                 // however we should flush the 'EffectEnded' message to any lingering clients
                 dispatch state chReply EffectEnded true |> ignore
@@ -251,14 +251,14 @@ module Async =
                     let next msg : Either<State<'t>, unit> =
                         match msg with
                         | Enqueue v when isTerminal v -> 
-                            printfn "Enqueued terminal: %A" v
+                            // printfn "Enqueued terminal: %A" v
                             drainReaders state v |> ignore
                             Right ()
                         | Enqueue v when Deque.isEmpty state.WaitingReaders ->
-                            printfn "Enqueued: %A" v
+                            // printfn "Enqueued: %A" v
                             Left { state with Queue = Deque.snoc (Left v) state.Queue }
                         | Enqueue v ->
-                            printfn "Enqueued but with waiting readers: %A" v
+                            // printfn "Enqueued but with waiting readers: %A" v
                             match state with
                             | Waiting (ch, st) ->
                                 reply st ch v |> Left
@@ -269,15 +269,15 @@ module Async =
                             if Deque.isEmpty state.Queue then
                                 // if we drained the mailbox prior to receiving this, we can shutdown
                                 if Deque.isEmpty state.WaitingReaders then
-                                    printfn "Completed with no pending messages - shutting down"
+                                    // printfn "Completed with no pending messages - shutting down"
                                     Right ()
                                 else
                                     // we have pending readers
-                                    printfn "Completed with pending readers - flushing with 'EffectEnded'"
+                                    // printfn "Completed with pending readers - flushing with 'EffectEnded'"
                                     drainReaders state EffectEnded |> ignore
                                     Right ()
                             else
-                                printfn "Completed with pending messages - pushing 'stop' to queue"
+                                // printfn "Completed with pending messages - pushing 'stop' to queue"
                                 let newQueue = Deque.snoc (Right WriterStopped) state.Queue
                                 Left { state with Queue = newQueue }
                     let! msg = inbox.Receive()
