@@ -6,7 +6,7 @@
 namespace Flux.IO.Internal
 
 [<AutoOpen>]
-module internal LList = 
+module LList = 
 
     open System
     open System.Collections.Generic
@@ -199,6 +199,24 @@ module internal LList =
         let tryTail(s: LazyList<'T>) = s.TryTail
 
         let isEmpty(s: LazyList<'T>) = s.IsEmpty
+
+        // Non-throwing variants for RealTimeDeque rotations
+        let rec takeAtMost n s =
+            lzy(fun () ->
+                if n <= 0 then
+                    CellEmpty
+                else
+                    match getCell s with
+                    | CellCons(a, s') -> consc a (takeAtMost (n - 1) s')
+                    | CellEmpty -> CellEmpty)
+
+        let rec dropAtMost n s =
+            if n <= 0 then
+                s
+            else
+                match getCell s with
+                | CellCons(_, s') -> dropAtMost (n - 1) s'
+                | CellEmpty -> empty
 
         let rec take n s =
             lzy(fun () ->

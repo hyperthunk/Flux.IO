@@ -12,7 +12,7 @@
 namespace Flux.IO.Internal
 
 [<AutoOpen>]
-module internal Deque = 
+module Deque = 
 
     open LList
     open System.Collections
@@ -68,17 +68,21 @@ module internal Deque =
 
                 let rec rotateRev c =
                     function
-                    | LazyList.Nil, r, a -> LazyList.append (LazyList.rev r) a
+                    | LazyList.Nil, r, a ->
+                        LazyList.append (LazyList.rev r) a
                     | LazyList.Cons(x, f), r, a ->
-                        let a' = LazyList.drop c r
-                        let b' = LazyList.append (LazyList.take c r) a |> LazyList.rev
+                        // SAFE: r may have fewer than c elements; use at-most variants
+                        let a' = LazyList.dropAtMost c r
+                        let b' = LazyList.append (LazyList.takeAtMost c r) a |> LazyList.rev
                         LazyList.cons x (rotateRev c (f, a', b'))
 
                 if j < c then
-                    rotateRev c (f, LazyList.drop j r, LazyList.empty)
+                    // SAFE: dropAtMost handles j > length r
+                    rotateRev c (f, LazyList.dropAtMost j r, LazyList.empty)
                 else
                     match f with
-                    | LazyList.Cons(x, f') -> LazyList.cons x (rotateDrop c f' (j - c) (LazyList.drop c r))
+                    | LazyList.Cons(x, f') ->
+                        LazyList.cons x (rotateDrop c f' (j - c) (LazyList.dropAtMost c r))
                     | _ -> failwith "should not get there"
 
             let n = RealTimeDeque.length q
@@ -86,12 +90,14 @@ module internal Deque =
             if q.frontLength > q.c * q.rBackLength + 1 then
                 let i = n / 2
                 let j = n - i
+                // Safe because front is the larger side in this branch (front >= n/2)
                 let f' = LazyList.take i q.front
                 let r' = rotateDrop q.c q.rBack i q.front
                 new RealTimeDeque<'T>(q.c, i, f', f', j, r', r')
             elif q.rBackLength > q.c * q.frontLength + 1 then
                 let j = n / 2
                 let i = n - j
+                // Safe because rBack is the larger side in this branch (rBack >= n/2)
                 let r' = LazyList.take j q.rBack
                 let f' = rotateDrop q.c q.front j q.rBack
                 new RealTimeDeque<'T>(q.c, i, f', f', j, r', r')
