@@ -98,19 +98,24 @@ module IntermediaryModelTests =
                         match state with Pending -> false | _ -> true
                     member _.Poll() =
                         match state with
-                        | Pending -> EffectPending
-                        | Success v -> EffectOutput (ValueSome v)
-                        | SuccessNone -> EffectOutput ValueNone
-                        | Failure ex -> EffectFailed ex
-                        | Cancelled ex -> EffectCancelled ex
-                    member this.Await() = this.Poll()
+                        | Pending -> Result EffectPending
+                        | Success v -> Result (EffectOutput (ValueSome v))
+                        | SuccessNone -> Result (EffectOutput ValueNone)
+                        | Failure ex -> Result (EffectFailed ex)
+                        | Cancelled ex -> Result (EffectCancelled ex)
+                    member this.Await() = 
+                        this.Poll() 
+                        |> function
+                        | Result r -> r
+                        | WaitResult thunk -> thunk()
                     member this.AwaitTimeout _ = this.Poll()
                     member _.Cancel() =
                         match state with
                         | Pending -> state <- Cancelled (OperationCanceledException() :> exn)
                         | _ -> ()
                     member this.CancelWait() = this.Cancel(); this.Await()
-                    member this.CancelWaitTimeout _ = this.CancelWait() }
+                    member this.CancelWaitTimeout _ = this.CancelWait() |> Result 
+                }
 
         let mkHandleFlow (h: MutableHandle<'T>) : Flow<EffectHandle<'T>> =
             { Program = FSync (fun _ -> h.ToEffectHandle()) }

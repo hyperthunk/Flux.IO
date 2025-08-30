@@ -5,6 +5,7 @@ open FSharp.HashCollections
 open System
 open System.Collections
 open System.Threading
+open System.Threading.Tasks
 
 type Timestamp = int64
 
@@ -277,6 +278,10 @@ type EffectResult<'a> =
 
         member this.Succeeded = not this.Failed
 
+type WaitableResult<'a> = 
+    | Result of EffectResult<'a>
+    | WaitResult of (unit -> EffectResult<'a>)
+
 module EffectResult =
     let inline map ([<InlineIfLambda>] mapping) result =
         match result with
@@ -310,15 +315,21 @@ type EffectHandle<'a>(internal token: BackendToken<'a>) =
     /// Check if the async operation is completed
     abstract member IsCompleted : bool
 
-    // NB: this would be a lot cleaner with higher kinded types...
-    // abstract member AsTokenSource<'t> : unit -> 't option
-    abstract member Poll: unit -> EffectResult<'a>
+    /// Poll for the result of the async operation (non-blocking)
+    /// NOTE: the semantics of polling may differ between backends.
+    /// In some implementations, non-blocking reads may lead to data
+    /// loss in the case of timeout.
+    abstract member Poll: unit -> WaitableResult<'a>
 
-    /// Await the completion of the async operation (blocks the caller)
+    /// Await the completion of the async operation (blocks the caller).
+    /// Implementations of this method should not lead to data loss.
     abstract member Await : unit -> EffectResult<'a>
     
-    /// Await with a timeout
-    abstract member AwaitTimeout : TimeSpan -> EffectResult<'a>
+    /// Await with a timeout.
+    /// NOTE: the semantics of timeouts may differ between backends.
+    /// In some implementations, non-blocking reads may lead to data
+    /// loss in the case of timeout.
+    abstract member AwaitTimeout : TimeSpan -> WaitableResult<'a>
     
     /// Cancel the async operation - returns immediately
     abstract member Cancel : unit -> unit
@@ -327,7 +338,7 @@ type EffectHandle<'a>(internal token: BackendToken<'a>) =
     abstract member CancelWait : unit -> EffectResult<'a> 
 
     /// Cancel and wait with timeout
-    abstract member CancelWaitTimeout : TimeSpan -> EffectResult<'a> 
+    abstract member CancelWaitTimeout : TimeSpan -> WaitableResult<'a>
 
 type EffectState<'T> =
     | NotStarted

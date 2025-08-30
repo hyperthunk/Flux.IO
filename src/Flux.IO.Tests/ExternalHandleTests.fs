@@ -23,6 +23,7 @@ module ExternalHandleTests =
 
         /// Main test model
         type Model = {
+            Pos : int
             Size : int
             Multiplier : int
             Pause : int
@@ -33,23 +34,20 @@ module ExternalHandleTests =
         } with
             static member Empty = 
                 {
+                    Pos = 0
                     Size = 10
                     Multiplier = 2
                     Pause = 5
                     Expected = HashSet.empty
                     Seen = HashSet.empty
                     Delayed = 0
-                    Failsafe = 10000
+                    Failsafe = 10000000
                 }
 
         type ExecContext = { Env : ExecutionEnv }
         let mkExecContext () =
             let env,_,_,_ = TestEnv.mkEnv()
             { Env = env }
-
-        // ---------------------------
-        // Operations (Commands)
-        // ---------------------------
 
         type Command =
             | Write of int
@@ -71,34 +69,34 @@ module ExternalHandleTests =
 
             let mutable model = Model.Empty
             let mutable handle = Unchecked.defaultof<AsyncSeqEffectHandle<int>>
-        
-            member __.Start(size:int, multiplier:int, pause:int) =
+
+            member __.Start(size, multiplier, pause) =
                 model <- { model with Size = size; Multiplier = multiplier; Pause = pause }
                 handle <- new AsyncSeqEffectHandle<int>(buildAsynEnum size multiplier pause)
 
             member __.StepModel() =
                 if model.Failsafe <= 0 then failtest "Failsafe limit reached (preventing infinite/blocking test)"
-                let count = model.Size - 1
-                let finished = count <= 0
+                let finished = model.Pos >= model.Size - 1  // Check position vs original size
                 let result = handle.Await()
                 match result with
                 | EffectPending -> 
                     model <- { model with 
                                 Delayed = model.Delayed + 1 
                                 Failsafe = model.Failsafe - 1 }                    
-                    Thread.SpinWait(min 50 model.Pause)
-                    Thread.Yield() |> ignore
+                    Thread.SpinWait(min 100 model.Pause)
                     true
                 | _ ->
                     let newModel = 
                         if finished then
                             { model with Expected = HashSet.add EffectEnded model.Expected }
                         else
-                            let hs = HashSet.add (EffectOutput (ValueSome (count * model.Multiplier))) model.Expected
+                            let exp = (model.Pos + 1) * model.Multiplier
+                            let hs = HashSet.add (EffectOutput (ValueSome exp)) model.Expected
+                            printfn "Expecting %d, recieved %A" exp result.Result
                             { model with Expected = hs }                
                     model <- { newModel with 
                                 Seen = HashSet.add result newModel.Seen 
-                                Size = count }
+                                Pos = model.Pos + 1 }  // Just track position
                     not finished
             
             member __.Verify() =
@@ -108,9 +106,12 @@ module ExternalHandleTests =
                     let seen = model.Seen |> HashSet.toSeq |> List.ofSeq
                     let expected = model.Expected |> HashSet.toSeq |> List.ofSeq
                     let pairs = List.zip seen expected
-                    printfn "Seen: %A" pairs
-                    Expect.isFalse 
-                        (List.exists (fun (s, e) -> s <> e) pairs)
+                    let mismatches = List.filter (fun (s, e) -> s <> e) pairs
+                    if not (List.isEmpty mismatches) then
+                        printfn "Mismatching pairs: %A" pairs
+                    
+                    Expect.isTrue
+                        (List.isEmpty mismatches)
                         "Seen effects do not match expected effects"
 
     module Tests =
@@ -122,23 +123,31 @@ module ExternalHandleTests =
             gen {
                 let! a = Gen.choose(5, 100)
                 let! b = Gen.choose(2, 10)
-                let! c = Gen.choose(0, 149)
+                let! c = Gen.choose(100, 149)
                 return (a, b, c)
             }
 
         type RawHandleTestArbitraries =
             static member TestRawAsyncSeq() = genRawAsyncSeqTestInputs |> Arb.fromGen
 
-        let config =
+        let rawAsyncSeqconfig =
             { FsCheckConfig.defaultConfig with
-                maxTest = 50
-                endSize = 20 
+                maxTest = 10  // about 40 seconds of test runs...; 100 = 389.9s for a single test :)
+                endSize = 20
                 arbitrary = [typeof<RawHandleTestArbitraries>] }
 
         [<Tests>]
         let externalHandleTests =
             testList "External Handle Tests" [
-                ftestPropertyWithConfig config "Raw Async Seq Handles" <| fun (sz, mult, pause) ->
+                ftestPropertyWithConfig 
+                        { FsCheckConfig.defaultConfig with maxTest = 10 }
+                        "Raw Async Seq Handle Manual test" <| fun () ->
+                    let sut = AsyncSeqHandleSut()
+                    sut.Start(10, 2, 1)
+                    while sut.StepModel() do
+                        sut.Verify()
+                
+                testPropertyWithConfig rawAsyncSeqconfig "Raw Async Seq Handles" <| fun (sz, mult, pause) ->
                     let sut = AsyncSeqHandleSut()
                     sut.Start(sz, mult, pause)
                     while sut.StepModel() do

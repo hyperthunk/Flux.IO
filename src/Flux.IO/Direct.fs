@@ -636,9 +636,9 @@ module Direct =
                         | Running (orig, handle, startedAt) ->
                             let res = handle.Poll()
                             match res with
-                            | EffectPending ->
+                            | Result EffectPending ->
                                 Consume
-                            | EffectOutput (ValueSome value) ->
+                            | Result (EffectOutput (ValueSome value)) ->
                                 let latencyMs = execEnv.NowUnix() - startedAt
                                 let outPayload = project orig value
                                 let baseEnv = mapPayload outPayload orig
@@ -651,17 +651,17 @@ module Direct =
                                     }
                                 state <- Idle
                                 Emit outEnv
-                            | EffectEnded ->
+                            | Result EffectEnded ->
                                 // TODO: FIXME: this fork will move out of direct soon anyway!!!
                                 state <- Idle
                                 Complete
-                            | EffectFailed ex ->
+                            | Result (EffectFailed ex) ->
                                 state <- Faulted ex
                                 Error ex
-                            | EffectCancelled oce ->
+                            | Result (EffectCancelled oce) ->
                                 state <- Faulted oce
                                 Error oce
-                            | EffectOutput ValueNone ->
+                            | Result (EffectOutput ValueNone) ->
                                 // TODO: Consider treating as protocol error
                                 state <- Faulted (InvalidOperationException "Effect completed without value.")
                                 Error (InvalidOperationException "Empty effect result")
@@ -765,17 +765,17 @@ module Direct =
                                 // Flatten: block (synchronously) until outer completes and extract inner
                                 let rec awaitOuter() =
                                     match outerHandle.Poll() with
-                                    | EffectPending ->
+                                    | Result EffectPending ->
                                         // Very short spin; for direct path we accept blocking
                                         Thread.SpinWait 40
                                         awaitOuter()
-                                    | EffectOutput (ValueSome inner) -> inner
-                                    | EffectOutput ValueNone ->
+                                    | Result (EffectOutput (ValueSome inner)) -> inner
+                                    | Result (EffectOutput ValueNone) ->
                                         raise (InvalidOperationException "External handle produced no inner handle")
-                                    | EffectEnded ->
+                                    | Result EffectEnded ->
                                         raise (InvalidOperationException "External handle ended unexpectedly")
-                                    | EffectFailed ex -> raise ex
-                                    | EffectCancelled oce -> raise oce
+                                    | Result (EffectFailed ex) -> raise ex
+                                    | Result (EffectCancelled oce) -> raise oce
                                 awaitOuter()
                         let effHandle = run env handleFlow.Program
                         // Adapt to outlet
@@ -789,7 +789,7 @@ module Direct =
             | Start of AsyncReplyChannel<unit>
             | Poll of AsyncReplyChannel<EffectResult<'T>>
             | Wait of AsyncReplyChannel<EffectResult<'T>>
-            | WaitTimeout of TimeSpan * AsyncReplyChannel<EffectResult<'T>>
+            | WaitTimeout of TimeSpan * AsyncReplyChannel<WaitableResult<'T>>
             | Cancel
         
         let lift (comp: Async<'T>) : Flow<'T> =
@@ -832,7 +832,7 @@ module Direct =
                                     reply.Reply EffectPending
                                     return! notStarted()
                                 | WaitTimeout (_, reply) ->
-                                    reply.Reply EffectPending
+                                    reply.Reply (Result EffectPending)
                                     return! notStarted()
                                 | Cancel ->
                                     return! notStarted()
@@ -858,9 +858,9 @@ module Direct =
                                     // Spawn async to wait with timeout
                                     async {
                                         if completed.Wait(ts) then
-                                            reply.Reply result
+                                            reply.Reply (Result result)
                                         else
-                                            reply.Reply EffectPending
+                                            reply.Reply (Result EffectPending)
                                     } |> Async.Start
                                     return! running()
                                 | Cancel ->
@@ -874,7 +874,7 @@ module Direct =
                         let createHandle() : EffectHandle<'T> =
                             { new EffectHandle<'T>(BackendToken agent) with
                                 member _.IsCompleted = completed.IsSet
-                                member _.Poll() = agent.PostAndReply Poll
+                                member _.Poll() = agent.PostAndReply Poll |> Result
                                 member _.Await() = agent.PostAndReply Wait
                                 member _.AwaitTimeout ts = 
                                     agent.PostAndReply(fun ch -> WaitTimeout(ts, ch))

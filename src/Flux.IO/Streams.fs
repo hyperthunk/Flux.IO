@@ -107,24 +107,28 @@ module Outlets =
                     // Poll underlying handle; capture result at first resolution
                     if not completed then
                         match handle.Poll() with
-                        | EffectPending -> ValueNone
-                        | EffectOutput (ValueSome v) ->
+                        | Result EffectPending -> ValueNone
+                        | Result (EffectOutput (ValueSome v)) ->
                             completed <- true
                             stored <- Some v
                             ValueSome v
-                        | EffectOutput ValueNone ->
+                        | Result (EffectOutput ValueNone) ->
                             completed <- true
                             error <- Some (InvalidOperationException "Effect returned no value.")
                             ValueNone
-                        | EffectFailed ex ->
+                        | Result (EffectFailed ex) ->
                             completed <- true
                             error <- Some ex
                             ValueNone
-                        | EffectCancelled ex ->
+                        | Result (EffectCancelled ex) ->
                             completed <- true
                             error <- Some ex
                             ValueNone
-                        | EffectEnded ->
+                        | Result EffectEnded ->
+                            completed <- true
+                            error <- Some (InvalidOperationException "Effect ended unexpectedly.")
+                            ValueNone
+                        | WaitResult f ->
                             completed <- true
                             error <- Some (InvalidOperationException "Effect ended unexpectedly.")
                             ValueNone

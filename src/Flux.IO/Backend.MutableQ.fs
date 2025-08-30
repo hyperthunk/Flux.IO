@@ -108,10 +108,11 @@ module Async =
     type internal Waiter<'t> = 
         | AsyncWaiter of AsyncReplyChannel<EffectResult<'t>> * int
         | TaskWaiter of TaskCompletionSource<EffectResult<'t>> * int
-    // type private Deque<'t> = RealTimeDeque<Either<EffectResult<'t>, Stopped>>
-    type internal EffectQueue<'t> = RealTimeDeque<Either<EffectResult<'t>, Stopped>>
-    type internal ReaderQueue<'t> = RealTimeDeque<Waiter<'t>>
 
+    // EFFECT QUEUE: use a simple SPSC mutable queue inside the mailbox thread
+    type internal EffectQueue<'t> = Queue<Either<EffectResult<'t>, Stopped>>
+    // WAITING READERS: stays on RealTimeDeque (small, bounded)
+    type internal ReaderQueue<'t> = RealTimeDeque<Waiter<'t>>
 
     type internal State<'t> = {
         Queue: EffectQueue<'t>
@@ -121,11 +122,7 @@ module Async =
 
     exception AsyncStateException of string
 
-    (* Reply to one of 3 channel types and maintain WaitingReaders:
-        - Choice1Of3: normal AsyncReplyChannel
-        - Choice2Of3: waiting TaskCompletionSource
-        - Choice3Of3: waiting AsyncReplyChannel
-    *)
+    (* Reply to one of 3 channel types and maintain WaitingReaders *)
     let rec inline internal reply 
             state
             (chReply : Choice<AsyncReplyChannel<EffectResult<'t>>,
@@ -186,34 +183,26 @@ module Async =
                                 AsyncReplyChannel<EffectResult<'t>>>) =
 
         printfn "Trying to dequeue with state: %A, reply: %A" state chReply
-        match Deque.tryUncons state.Queue with
-        | None -> 
+        if state.Queue.Count = 0 then
             printfn "Dequeue: state.Queue empty (EffectPending)"
             reply state chReply EffectPending |> Left
-        | Some (Left v, t) ->
-            printfn "Dequeued: %A (from state.Queue)" v
-            reply state chReply v |> fun s -> Left { s with Queue = t }
-        | Some (Right WriterStopped, t) ->
-            if Deque.isEmpty t then
-                printfn "Dequeued (WriterStopped): %A" WriterStopped
-                // if we drained the mailbox prior to receiving this, we can shutdown
-                // however we should flush the 'EffectEnded' message to any lingering clients
-                dispatch state chReply EffectEnded true |> ignore
-                Right ()
-            else
-                (* 
-                    This is really an odd case, but if we saw `Enqueue` after `Stop`,
-                    we now push "stop" to the back of the queue and continue reading.
-
-                    Because we have messages waiting, we are assuming that clients are still
-                    going to turn up and consume them. We may want to introduce a policy-driven
-                    timeout here, to ensure that we don't wait indefinitely.
-                *)
-                Left { state with 
-                        Queue = Deque.snoc (Right WriterStopped) t }
-        | Some (Neither, _) -> 
-            // compiler foo: we never cons/snoc 'Neither' to the queue
-            Left state
+        else
+            let item = state.Queue.Dequeue()
+            match item with
+            | Left v ->
+                printfn "Dequeued: %A (from state.Queue)" v
+                reply state chReply v |> Left
+            | Right WriterStopped ->
+                if state.Queue.Count = 0 then
+                    printfn "Dequeued (WriterStopped): %A" WriterStopped
+                    // if we drained the mailbox prior to receiving this, we can shutdown
+                    // however we should flush the 'EffectEnded' message to any lingering clients
+                    dispatch state chReply EffectEnded true |> ignore
+                    Right ()
+                else
+                    (* We saw `Enqueue` after `Stop`, push "stop" to the back of the queue and continue. *)
+                    state.Queue.Enqueue (Right WriterStopped)
+                    Left state
 
     type AsyncSeqEffectHandle<'t>(enum : IAsyncEnumerable<'t>) =
         inherit EffectHandle<'t>(BackendToken enum)
@@ -221,11 +210,11 @@ module Async =
         (*********************************************************)
         (*    DO NOT WRITE OUTSIDE OF MailboxProcessor.Start     *)
         (*********************************************************)
-        let hResult = TaskCompletionSource<EffectResult<'t>>()
+        let hResult = TaskCompletionSource<EffectResult<'t>>() // could add RunContinuationsAsynchronously
 
         let emptyState = 
             {
-                Queue = Deque.empty 4
+                Queue = new Queue<Either<EffectResult<'t>, Stopped>>()
                 WaitingReaders = Deque.empty 2
                 NextWaiterID = 1
             }
@@ -246,8 +235,6 @@ module Async =
                 // server loop maintains a receive queue in isolation in this thread
                 let rec loop state = async {
                     mboxToken.Token.ThrowIfCancellationRequested()                        
-                    // TODO: track the number of times we've been asked to Dequeue but are 'empty'
-                    // if use some kind of threshold to decide on yielding our time slice...
                     let next msg : Either<State<'t>, unit> =
                         match msg with
                         | Enqueue v when isTerminal v -> 
@@ -256,7 +243,8 @@ module Async =
                             Right ()
                         | Enqueue v when Deque.isEmpty state.WaitingReaders ->
                             printfn "Enqueued: %A" v
-                            Left { state with Queue = Deque.snoc (Left v) state.Queue }
+                            state.Queue.Enqueue (Left v)
+                            Left state
                         | Enqueue v ->
                             printfn "Enqueued but with waiting readers: %A" v
                             match state with
@@ -266,20 +254,18 @@ module Async =
                         | Dequeue chReply         -> tryDequeue state (Choice1Of3 chReply)
                         | BlockingDequeue chReply -> tryDequeue state (Choice3Of3 chReply)
                         | Complete ->
-                            if Deque.isEmpty state.Queue then
-                                // if we drained the mailbox prior to receiving this, we can shutdown
+                            if state.Queue.Count = 0 then
                                 if Deque.isEmpty state.WaitingReaders then
                                     printfn "Completed with no pending messages - shutting down"
                                     Right ()
                                 else
-                                    // we have pending readers
                                     printfn "Completed with pending readers - flushing with 'EffectEnded'"
                                     drainReaders state EffectEnded |> ignore
                                     Right ()
                             else
                                 printfn "Completed with pending messages - pushing 'stop' to queue"
-                                let newQueue = Deque.snoc (Right WriterStopped) state.Queue
-                                Left { state with Queue = newQueue }
+                                state.Queue.Enqueue (Right WriterStopped)
+                                Left state
                     let! msg = inbox.Receive()
                     let next = next msg
                     if next.IsRight then
@@ -299,52 +285,25 @@ module Async =
             })
 
         let workerToken = new CancellationTokenSource()
-        (* do
-            workerToken.Token.Register(Action(fun () -> stop ())) |> ignore *)
-
         let mboxToken = CancellationTokenSource.CreateLinkedTokenSource workerToken.Token
-
         let mbox = startListener mboxToken
-        
-        // NOT: synchronous enumerating can drive thread-pool exhaustion!
 
-        (* let hAsync = async {
-            // let hEnum = enum.GetAsyncEnumerator workerToken.Token            
-            try
-                for item in enum do
-                    workerToken.Token.ThrowIfCancellationRequested()
-                    mbox.Post (Enqueue (EffectOutput (ValueSome item)))
-                (* while hEnum.MoveNextAsync().AsTask().Result && 
-                        not workerToken.IsCancellationRequested do
-                    mbox.Post (Enqueue (EffectDone (ValueSome hEnum.Current))) *)
-                mbox.Post Complete
-            with 
-            | :? OperationCanceledException as oce ->
-                mbox.Post (Enqueue (EffectCancelled oce))
-            | ex ->
-                mbox.Post (Enqueue (EffectFailed ex))
-        } in do Async.Start(hAsync, workerToken.Token) *)
-
-        (* DO NOT touch outside of the async writer block *)
+        // Writer
         let mutable enumerator = Unchecked.defaultof<IAsyncEnumerator<'t>>
 
         let hWriter = async {
-            // NOTE: handle exceptions outside 'consumeNext' via 'hAsync' wrapper
             enumerator <- enum.GetAsyncEnumerator workerToken.Token
             let rec consumeNext() = async {
                 workerToken.Token.ThrowIfCancellationRequested()
-                    
                 let! hasNext = 
                     enumerator.MoveNextAsync().AsTask() 
                     |> Async.AwaitTask
-                
                 if hasNext then
                     mbox.Post (Enqueue (EffectOutput (ValueSome enumerator.Current)))
                     return! consumeNext()
                 else
                     mbox.Post Complete
             }            
-            
             do! consumeNext()
         } 
         
@@ -364,7 +323,6 @@ module Async =
                     with _ -> ()
         } in do Async.Start(hAsync, workerToken.Token)
 
-
         override __.IsCompleted = hResult.Task.IsCompleted
 
         override __.Poll() = 
@@ -374,7 +332,6 @@ module Async =
             else
                 let tcs = new TaskCompletionSource<EffectResult<'t>>()
                 mbox.Post (TimedDequeue tcs)
-
                 if tcs.Task.IsCompleted then
                     tcs.Task.Result |> Result
                 else
@@ -389,8 +346,6 @@ module Async =
 
             let died =
                 async {
-                    // If the server loop completes (Ended/Failed/Cancelled) before the read is served,
-                    // return that terminal result instead of waiting forever.
                     let! res = Async.AwaitTask hResult.Task
                     return Some res
                 }
@@ -474,51 +429,3 @@ module Async =
             member _.IsCompleted = false
             member _.Start() = failwith "Not implemented"
             member _.Dispose() = ()
-
-    (* let startSingleOutlet<'T> (block: Async<'T>) : EffectOutlet<'T> = 
-        let hMbox = MailboxProcessor.Start(fun mbox -> async {
-            try
-                let! result = block
-
-                // Store result for repeated TryDequeue
-            with ex ->
-                // Store error
-        })
-
-        let hAsync = buildAsyncHandle block |> _.Start()
-        { new EffectOutlet<'T> with
-            member __.Kind = SingleValue
-            member __.TryDequeue() =
-                hAsync.Poll() |> function
-                | EffectOutput (ValueSome result) -> ValueSome result
-                | _ -> ValueNone
-            member __.AwaitActivity ts = 
-                failwith "Not implemented"
-
-            member __.IsCompleted = false
-            member __.Error = None
-            member __.Dispose () = ()
-        } *)
-    
-    let createStreamOutlet<'T> (enum: IAsyncEnumerable<'T>) : EffectOutlet<'T> = 
-        { new EffectOutlet<'T> with
-            member __.Kind = Unknown
-            member __.TryDequeue() =
-                failwith "Not implemented"
-            member __.AwaitActivity ts = false
-            member __.IsCompleted = false
-            member __.Error = None
-            member __.Dispose () = ()
-        }
-
-(* 
-
-module Task =
-    val createSingleOutlet : Task<'T> -> EffectOutlet<'T>
-    val createStreamOutlet : IAsyncEnumerable<'T> -> EffectOutlet<'T>
-
-module Hopac =
-    val createSingleOutlet : Job<'T> -> EffectOutlet<'T>  
-    val createStreamOutlet : Stream<'T> -> EffectOutlet<'T> 
-    
-*)

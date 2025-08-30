@@ -49,32 +49,37 @@ module Lift =
                                 
                                 member _.Poll() =
                                     if task.IsCompletedSuccessfully then 
-                                        EffectOutput (ValueSome task.Result)
+                                        EffectOutput (ValueSome task.Result) |> Result
                                     elif task.IsFaulted then 
                                         let ex =
                                             match task.Exception with
                                             | null -> null
                                             | ae when isNull ae.InnerException -> ae :> exn
                                             | ae -> ae.InnerException
-                                        if isNull ex then EffectFailed (Exception())
-                                        else EffectFailed ex
+                                        if isNull ex then EffectFailed (Exception()) |> Result
+                                        else EffectFailed ex |> Result
                                     elif task.IsCanceled then 
-                                        EffectCancelled (OperationCanceledException())
-                                    else EffectPending
-                                
+                                        EffectCancelled (OperationCanceledException()) |> Result
+                                    else EffectPending |> Result
+
                                 member this.Await() =
                                     tryWrap (fun() -> 
                                         task.Wait()
                                         this.Poll()
+                                        |> function
+                                            | Result r -> r
+                                            | WaitResult f -> f()
                                     )
                                 
                                 member this.AwaitTimeout ts = 
                                     tryWrap (fun() ->
                                         if task.Wait(ts) then 
-                                            this.Poll()
+                                            this.Poll() |> function
+                                                | Result r -> r
+                                                | WaitResult f -> f()
                                         else 
                                             EffectPending
-                                    )
+                                    ) |> Result
                                 
                                 member _.Cancel() = () //TODO: actually cancel it?
                                 member this.CancelWait() = this.Await()
@@ -116,31 +121,36 @@ module Lift =
                             
                             member _.Poll() =
                                 if task.IsCompletedSuccessfully then
-                                    EffectOutput (ValueSome task.Result)
+                                    EffectOutput (ValueSome task.Result) |> Result
                                 elif task.IsFaulted then
                                     let ex =
                                         match task.Exception with
                                         | null -> null
                                         | ae when Object.ReferenceEquals(ae.InnerException, null) -> ae :> exn
                                         | ae -> ae.InnerException
-                                    if isNull ex then EffectFailed (Exception())
-                                    else EffectFailed ex
+                                    if isNull ex then EffectFailed (Exception()) |> Result
+                                    else EffectFailed ex |> Result
                                 elif task.IsCanceled then
-                                    EffectCancelled (OperationCanceledException())
+                                    EffectCancelled (OperationCanceledException()) |> Result
                                 else
-                                    EffectPending
+                                    EffectPending |> Result
                             
                             member this.Await() =
                                 tryWrap (fun() -> 
                                     task.Wait()
-                                    this.Poll()
+                                    this.Poll() |> function
+                                        | Result r -> r
+                                        | WaitResult f -> f()
                                 )
                             
                             member this.AwaitTimeout ts =
                                 tryWrap (fun() -> 
-                                    if task.Wait ts then this.Poll()
+                                    if task.Wait ts then 
+                                        this.Poll() |> function
+                                            | Result r -> r
+                                            | WaitResult f -> f()
                                     else EffectPending
-                                )
+                                ) |> Result
                             
                             member _.Cancel() = cts.Cancel()
                             
@@ -196,22 +206,28 @@ module Lift =
                 { new EffectHandle<'T>(BackendToken taskRef) with
                     member _.IsCompleted = taskRef.IsCompleted
                     member _.Poll() =
-                        if taskRef.IsCompletedSuccessfully then EffectOutput (ValueSome taskRef.Result)
+                        if taskRef.IsCompletedSuccessfully then 
+                            EffectOutput (ValueSome taskRef.Result) |> Result
                         elif taskRef.IsFaulted then
                             let ex =
                                 match taskRef.Exception with
                                 | null -> null
                                 | ae when isNull ae.InnerException -> ae :> exn
                                 | ae -> ae.InnerException
-                            if isNull ex then EffectFailed (Exception())
-                            else EffectFailed ex
-                        elif taskRef.IsCanceled then EffectCancelled (OperationCanceledException())
-                        else EffectPending
+                            if isNull ex then 
+                                EffectFailed (Exception()) |> Result
+                            else EffectFailed ex |> Result
+                        elif taskRef.IsCanceled then EffectCancelled (OperationCanceledException()) |> Result
+                        else EffectPending |> Result
                     member this.Await() =
                         taskRef.Wait()
-                        this.Poll()
+                        this.Poll() |> function
+                            | Result r -> r
+                            | WaitResult f -> f()
                     member this.AwaitTimeout ts =
-                        if taskRef.Wait ts then this.Poll() else EffectPending
+                        if taskRef.Wait ts then 
+                            this.Poll() 
+                        else EffectPending |> Result
                     member _.Cancel() = cancellation()
                     member this.CancelWait() = 
                         this.Cancel()
