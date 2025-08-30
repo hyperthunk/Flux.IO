@@ -132,18 +132,18 @@ module ExternalHandleTests =
 
         let rawAsyncSeqconfig =
             { FsCheckConfig.defaultConfig with
-                maxTest = 10  // about 40 seconds of test runs...; 100 = 389.9s for a single test :)
-                endSize = 20
+                maxTest = 5  // about 23 seconds of test runs...; 100 = 389.9s for a single test case :)
+                endSize = 10 // keep the end test state small so we don't spend forever in here, --stress can pick up the slack
                 arbitrary = [typeof<RawHandleTestArbitraries>] }
 
         [<Tests>]
         let externalHandleTests =
             testList "External Handle Tests" [
-                ftestPropertyWithConfig 
+                testPropertyWithConfig 
                         { FsCheckConfig.defaultConfig with maxTest = 10 }
-                        "Raw Async Seq Handle Manual test" <| fun () ->
+                        "Async Seq Handle With Bursty Producer" <| fun () ->
                     let sut = AsyncSeqHandleSut()
-                    sut.Start(10, 2, 1)
+                    sut.Start(10, 2, 1)  // setting delay to 1 creates a very "fast" writer
                     while sut.StepModel() do
                         sut.Verify()
                 
