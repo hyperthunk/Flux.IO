@@ -11,14 +11,14 @@
 (*
     Flux.IO ChangeLog..
 
-    Our use of this collection hits a certain point of fragility: 
+    Our use of this collection in bursty patterns, hits a certain point of fragility: 
     `check`’s rotation uses `LazyList.take c r`, which throws when n > length. 
     
     Under heavy front/very small back (precisely the rebalance trigger case), 
     r can be shorter than c (2), so take raises “not enough items in the list”.
     
-    + Changes to support robust behaviour under "bursty" usage patterns.
-
+    Changes: 
+    
     Rotation now treats r as a possibly short stream and only consumes up 
     to c items per step. 
     
@@ -29,6 +29,25 @@
     Now `check2` remains mathematically safe because each branch only takes 
     from the larger side (≥ n/2), so take i (front) or take j (back) won’t overrun.
 
+    Asymptotic Complexity Analysis:
+
+    The only functional change is replacing the use of `LazyList.drop` with “at most” 
+    variants inside the rotation (`rotateDrop`/`rotateRev`) used by `RealTimeDeque.check`. 
+    
+    - Those operations still run in O(min(c, |r|)) per step with c being the small constant 
+    ratio parameter (≥ 2). So each rotation step remains O(1).
+
+    - The rebalancing (check/check2) still constructs new streams whose cost is scheduled via 
+    `exec1`/`exec2`, preserving the real‑time O(1) worst‑case per deque operation (Cons, Snoc, 
+    Tail, Init, Head, Last).
+
+    - Linear operations (append, remove/update by index, etc.) remain O(n) or O(n/2) as before.
+
+    - Amortization and streaming semantics are unchanged, since we don't alter `exec1`/`exec2`,
+    nor the ways in which streams are advanced. The rotation is now more robust when the smaller 
+    side has fewer than c elements.
+
+    The net effect is that we have the same asymptotic bounds and only constant factors are affected.
 *)
 
 namespace Flux.IO.Internal
