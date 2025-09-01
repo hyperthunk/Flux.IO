@@ -282,6 +282,16 @@ type WaitableResult<'a> =
     | Result of EffectResult<'a>
     | WaitResult of (unit -> EffectResult<'a>)
 
+    member this.IsCompleted =
+        match this with
+        | Result r -> r.IsCompleted
+        | WaitResult _ -> false
+
+    member this.Force() =
+        match this with
+        | Result r -> r
+        | WaitResult f -> f ()
+
 module EffectResult =
     let inline map ([<InlineIfLambda>] mapping) result =
         match result with
