@@ -61,7 +61,7 @@ module ExternalHandleTests =
             taskSeq {
                 for i in 1 .. size do
                     do! Async.Sleep(min 150 pause)
-                    printfn "Yielding %d" (i * multiplier)
+                    // printfn "Yielding %d" (i * multiplier)
                     yield i * multiplier
             }
 
@@ -92,7 +92,7 @@ module ExternalHandleTests =
                         else
                             let exp = (model.Pos + 1) * model.Multiplier
                             let hs = HashSet.add (EffectOutput (ValueSome exp)) model.Expected
-                            printfn "Expecting %d, recieved %A" exp result.Result
+                            // printfn "Expecting %d, recieved %A" exp result.Result
                             { model with Expected = hs }                
                     model <- { newModel with 
                                 Seen = HashSet.add result newModel.Seen 
@@ -138,7 +138,7 @@ module ExternalHandleTests =
 
         [<Tests>]
         let externalHandleTests =
-            ftestList "External Handle Tests" [
+            testList "External Handle Tests" [
                 testPropertyWithConfig 
                         { FsCheckConfig.defaultConfig with maxTest = 10 }
                         "Async Seq Handle With Bursty Producer" <| fun () ->

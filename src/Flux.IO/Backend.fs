@@ -306,7 +306,7 @@ module Async =
 
         let mbox = startListener mboxToken
         
-        // NOT: synchronous enumerating can drive thread-pool exhaustion!
+        // NOT: synchronously enumerating can drive thread-pool exhaustion!
 
         (* let hAsync = async {
             // let hEnum = enum.GetAsyncEnumerator workerToken.Token            
