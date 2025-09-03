@@ -57,6 +57,7 @@ module ExternalHandleTests =
             | DelayedWrite of 't * int
             | Fail of exn
             | NoOp
+            | Cancel
 
         let buildAsynEnum size multiplier pause = 
             taskSeq {
@@ -74,22 +75,25 @@ module ExternalHandleTests =
                     let! cmd = chCommand.Reader.ReadAsync().AsTask()
                     match cmd with
                     | Choice1Of2 (Write value) -> 
-                        printfn "yielding %A" value
+                        // printfn "yielding %A" value
                         yield value
                     | Choice1Of2 (DelayedWrite (value, delay)) -> 
-                        printfn "delaying for %dms" delay
+                        // printfn "delaying for %dms" delay
                         do! Async.Sleep delay
-                        printfn "yielding %A" value
+                        // printfn "yielding %A" value
                         yield value
                     | Choice1Of2 (Fail ex) -> 
-                        printfn "failing with %A" ex
+                        // printfn "failing with %A" ex
                         raise ex
                     | Choice1Of2 NoOp -> 
-                        printfn "no-op"
+                        // printfn "no-op"
                         ()
                     | Choice2Of2 () ->
-                        printfn "stopping"
+                        // printfn "stopping"
                         cont <- false
+                    | Choice1Of2 Cancel ->
+                        // this command should never be send to the server...
+                        ()
             }
             chCommand, tSeq
 
@@ -120,14 +124,17 @@ module ExternalHandleTests =
                 |> ignore
 
             member __.Step cmd = 
-                if chWorker.IsSome then
+                if cmd = Cancel then
+                    hAsync.Value.CancelWait() |> Some 
+                elif chWorker.IsSome then
                     let success = chWorker.Value.Writer.TryWrite (Choice1Of2 cmd) 
                     if not success then failwith "Failed to write command to channel"
+                    else None
+                else None
 
             member __.Dispose () = 
                 if hAsync.IsSome then
                     (hAsync.Value :> IDisposable).Dispose()
-
 
         type AsyncSeqPropRunner<'t when 't : equality>(sut : AsyncSeqCmdSut<'t>) =
 
@@ -136,9 +143,14 @@ module ExternalHandleTests =
                     match cmds with
                     | [] -> ()
                     | cmd :: rest ->
-                        sut.Step cmd
+                        let output = sut.Step cmd
                         let terminated = 
                             match cmd with
+                            | Cancel ->
+                                Expect.isSome output "Expected Cancel to return an EffectResult"
+                                match output.Value with
+                                | EffectCancelled _ -> true
+                                | eff -> failwith (sprintf "Cancel Unexpected effect: %A" eff)
                             | Write value ->
                                 match sut.Handle.Await() with
                                 | EffectOutput (ValueSome result) ->
@@ -280,13 +292,13 @@ module ExternalHandleTests =
                     let! msg = Gen.elements ["Failure"; "Exception"; "Error"]
                     return Fail (Exception msg)
                 }
-            let genNoOp = Gen.constant NoOp
             Gen.sized (fun size ->
                 Gen.listOfLength (max 20 (min 3 (size - 2))) (Gen.frequency [
-                    7, genWrite
-                    3, genDelayedWrite
+                    8, genWrite
+                    4, genDelayedWrite
+                    2, Gen.constant NoOp
                     1, genFail
-                    1, genNoOp
+                    1, Gen.constant Cancel
                 ])
             )
 
@@ -303,8 +315,9 @@ module ExternalHandleTests =
         [<Tests>]
         let externalHandleTests =
             testList "External Handle Tests" [
-                testPropertyWithConfig rawAsyncSeqconfig "Async Seq Handle With Arbitrary Commands" <| fun cmds ->
-                    printfn "Testing Operations %A" cmds
+                testPropertyWithConfig 
+                        { rawAsyncSeqconfig with maxTest = 25 }
+                        "Async Seq Handle With Arbitrary Commands" <| fun cmds ->
                     let sut = AsyncSeqCmdSut<int>()
                     let runner = AsyncSeqPropRunner<int> sut
                     runner.Run cmds
