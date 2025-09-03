@@ -470,8 +470,8 @@ module StreamCommand =
     type StreamCommandComparerT<'T> =
         struct end
         interface IEqualityComparer<StreamCommand<'T>> with
-            member this.GetHashCode (x: StreamCommand<'T>) = StreamCommandComparer.GetHashCode x
-            member this.Equals (x: StreamCommand<'T>, y: StreamCommand<'T>) = StreamCommandComparer.Equals (x, y)
+            member __.GetHashCode (x: StreamCommand<'T>) = StreamCommandComparer.GetHashCode x
+            member __.Equals (x: StreamCommand<'T>, y: StreamCommand<'T>) = StreamCommandComparer.Equals (x, y)
 
 (* 
     Direct Flow Program Representation
