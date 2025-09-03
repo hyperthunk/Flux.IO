@@ -98,17 +98,14 @@ module IntermediaryModelTests =
                         match state with Pending -> false | _ -> true
                     member _.Poll() =
                         match state with
-                        | Pending -> Result EffectPending
-                        | Success v -> Result (EffectOutput (ValueSome v))
-                        | SuccessNone -> Result (EffectOutput ValueNone)
-                        | Failure ex -> Result (EffectFailed ex)
-                        | Cancelled ex -> Result (EffectCancelled ex)
+                        | Pending -> EffectPending
+                        | Success v -> EffectOutput (ValueSome v)
+                        | SuccessNone -> EffectOutput ValueNone
+                        | Failure ex -> EffectFailed ex
+                        | Cancelled ex -> EffectCancelled ex
                     member this.Await() = 
                         this.Poll() 
-                        |> function
-                        | Result r -> r
-                        | WaitResult thunk -> thunk()
-                    member this.AwaitTimeout _ = this.Poll()
+                    member this.AwaitTimeout _ = this.Poll() |> Result
                     member _.Cancel() =
                         match state with
                         | Pending -> state <- Cancelled (OperationCanceledException() :> exn)

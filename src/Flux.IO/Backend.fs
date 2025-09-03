@@ -30,25 +30,24 @@ module Handles =
                     member _.IsCompleted = taskRef.IsCompleted
                     member _.Poll() =
                         if taskRef.IsCompletedSuccessfully then 
-                            Result (EffectOutput (ValueSome taskRef.Result))
+                            EffectOutput (ValueSome taskRef.Result)
                         elif taskRef.IsFaulted then
                             let ex =
                                 match taskRef.Exception with
                                 | null -> null
                                 | ae when isNull ae.InnerException -> ae :> exn
                                 | ae -> ae.InnerException
-                            if isNull ex then EffectFailed (Exception()) |> Result
-                            else EffectFailed ex |> Result
+                            if isNull ex then EffectFailed (Exception())
+                            else EffectFailed ex
                         elif taskRef.IsCanceled then 
-                            EffectCancelled (OperationCanceledException()) |> Result
-                        else EffectPending |> Result
+                            EffectCancelled (OperationCanceledException())
+                        else EffectPending
                     member this.Await() =
                         taskRef.Wait()
-                        this.Poll() |> function
-                            | Result r -> r
-                            | WaitResult thunk -> thunk()
+                        this.Poll()
                     member this.AwaitTimeout ts =
-                        if taskRef.Wait ts then this.Poll() else EffectPending |> Result
+                        taskRef.Wait ts |> ignore 
+                        this.Poll() |> Result
                     member _.Cancel() = cancellation()
                     member this.CancelWait() = 
                         this.Cancel()
@@ -136,6 +135,11 @@ module Async =
         let state' =
             match chReply, msg with
             | Choice1Of3 rc, _ -> rc.Reply msg; state
+            | Choice2Of3 tcs, EffectPending -> 
+                { state with 
+                    WaitingReaders = Deque.snoc (TaskWaiter (tcs, state.NextWaiterID)) state.WaitingReaders
+                    NextWaiterID = state.NextWaiterID + 1
+                }
             | Choice2Of3 tcs, _ -> tcs.SetResult msg; state
             // TODO: EffectEnded with waiting readers...
             | Choice3Of3 rc, EffectPending -> 
@@ -246,14 +250,14 @@ module Async =
                 // server loop maintains a receive queue in isolation in this thread
                 let rec loop state = async {
                     mboxToken.Token.ThrowIfCancellationRequested()                        
-                    // TODO: track the number of times we've been asked to Dequeue but are 'empty'
-                    // if use some kind of threshold to decide on yielding our time slice...
                     let next msg : Either<State<'t>, unit> =
                         match msg with
                         | Enqueue v when isTerminal v -> 
                             // printfn "Enqueued terminal: %A" v
                             drainReaders state v |> ignore
-                            Right ()
+                            match v with
+                            | EffectFailed ex -> raise ex  // raise to ensure we show the failure to clients
+                            | _ -> Right ()  // simply mark the effect as ended
                         | Enqueue v when Deque.isEmpty state.WaitingReaders ->
                             // printfn "Enqueued: %A" v
                             Left { state with Queue = Deque.snoc (Left v) state.Queue }
@@ -291,9 +295,9 @@ module Async =
                 let hAsync = loop emptyState                
                 Async.StartWithContinuations(
                     hAsync,
-                    (fun () -> hResult.SetResult EffectEnded), // completed: 'stop' set by 'loop'
-                    (fun ex -> hResult.SetResult (EffectFailed ex)), // error: requires 'stop'
-                    (fun ex -> hResult.SetResult (EffectCancelled ex)),  // cancelled: requires 'stop'
+                    (fun () -> hResult.SetResult EffectEnded),          // completed
+                    (fun ex -> hResult.SetResult (EffectFailed ex)),    // error
+                    (fun ex -> hResult.SetResult (EffectCancelled ex)), // cancelled
                     mboxToken.Token    
                 )
             })
@@ -370,15 +374,9 @@ module Async =
         override __.Poll() = 
             if workerToken.IsCancellationRequested || 
                hResult.Task.IsCompleted || 
-               hResult.Task.IsFaulted then hResult.Task.Result |> Result
+               hResult.Task.IsFaulted then hResult.Task.Result
             else
-                let tcs = new TaskCompletionSource<EffectResult<'t>>()
-                mbox.Post (TimedDequeue tcs)
-
-                if tcs.Task.IsCompleted then
-                    tcs.Task.Result |> Result
-                else
-                    WaitResult (fun () -> tcs.Task.Result)
+                mbox.PostAndReply (fun rc -> Dequeue rc)
 
         override __.Await (): EffectResult<'t> =
             let read =

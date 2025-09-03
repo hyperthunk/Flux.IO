@@ -329,7 +329,7 @@ type EffectHandle<'a>(internal token: BackendToken<'a>) =
     /// NOTE: the semantics of polling may differ between backends.
     /// In some implementations, non-blocking reads may lead to data
     /// loss in the case of timeout.
-    abstract member Poll: unit -> WaitableResult<'a>
+    abstract member Poll: unit -> EffectResult<'a>
 
     /// Await the completion of the async operation (blocks the caller).
     /// Implementations of this method should not lead to data loss.

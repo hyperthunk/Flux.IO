@@ -634,7 +634,7 @@ module Direct =
                             state <- Running (envIn, handle, execEnv.NowUnix())
                             Consume
                         | Running (orig, handle, startedAt) ->
-                            let res = handle.Poll().Force()
+                            let res = handle.Poll()
                             match res with
                             | EffectPending ->
                                 Consume
@@ -764,7 +764,7 @@ module Direct =
 
                                 // Flatten: block (synchronously) until outer completes and extract inner
                                 let rec awaitOuter() =
-                                    match outerHandle.Poll().Force() with
+                                    match outerHandle.Poll() with
                                     | EffectPending ->
                                         // Very short spin; for direct path we accept blocking
                                         Thread.SpinWait 40
@@ -874,7 +874,7 @@ module Direct =
                         let createHandle() : EffectHandle<'T> =
                             { new EffectHandle<'T>(BackendToken agent) with
                                 member _.IsCompleted = completed.IsSet
-                                member _.Poll() = agent.PostAndReply Poll |> Result
+                                member _.Poll() = agent.PostAndReply Poll
                                 member _.Await() = agent.PostAndReply Wait
                                 member _.AwaitTimeout ts = 
                                     agent.PostAndReply(fun ch -> WaitTimeout(ts, ch))

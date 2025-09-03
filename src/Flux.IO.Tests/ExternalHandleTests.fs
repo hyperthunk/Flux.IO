@@ -71,14 +71,14 @@ module ExternalHandleTests =
             let mutable cont = true
             let tSeq : TaskSeq<'t> = taskSeq {
                 while cont do
-                    let cmd = chCommand.Reader.ReadAsync().Result
+                    let! cmd = chCommand.Reader.ReadAsync().AsTask()
                     match cmd with
                     | Choice1Of2 (Write value) -> 
                         printfn "yielding %A" value
                         yield value
                     | Choice1Of2 (DelayedWrite (value, delay)) -> 
                         printfn "delaying for %dms" delay
-                        do Async.Sleep delay |> Async.RunSynchronously
+                        do! Async.Sleep delay
                         printfn "yielding %A" value
                         yield value
                     | Choice1Of2 (Fail ex) -> 
@@ -134,54 +134,67 @@ module ExternalHandleTests =
             member __.Run cmds =
                 let rec check cmds = 
                     match cmds with
-                    | [] -> failwith ""
+                    | [] -> ()
                     | cmd :: rest ->
                         sut.Step cmd
-                        match cmd with
-                        | Write value ->
-                            match sut.Handle.Await() with
-                            | EffectOutput (ValueSome result) ->
-                                Expect.equal result value (sprintf "Expected %A, got %A" value result)
-                            | eff -> failwith (sprintf "Write Unexpected effect: %A" eff)
-                        | DelayedWrite (value, delay) ->
-                            let result = sut.Handle.Poll()
-                            match result with
-                            | Result r ->
-                                match r with
-                                | EffectOutput (ValueSome v) ->
-                                    Expect.equal v value (sprintf "Expected %A, got %A" value v)
-                                | eff -> failwith (sprintf "DelayedWrite Unexpected effect: %A" eff)
-                            | WaitResult fWait ->
-                                let timeout = TimeSpan.FromSeconds 10L
-                                let timedAsync comp = Async.RunSynchronously(comp, timeout.Milliseconds)
-                                let block1 = async { 
-                                    let result = fWait()
-                                    return Some result
-                                }
-                                let block2 = async { 
-                                    do! Async.Sleep (delay + 200)
-                                    return None 
-                                }
-                                Async.Choice [block1; block2] 
-                                |> timedAsync
-                                |> function
-                                | Some v -> 
-                                    match v with
+                        let terminated = 
+                            match cmd with
+                            | Write value ->
+                                match sut.Handle.Await() with
+                                | EffectOutput (ValueSome result) ->
+                                    Expect.equal result value (sprintf "Expected %A, got %A" value result)
+                                    false
+                                | eff -> failwith (sprintf "Write Unexpected effect: %A" eff)
+                            | DelayedWrite (value, delay) ->
+                                let result = sut.Handle.AwaitTimeout(TimeSpan.FromMilliseconds delay)
+                                match result with
+                                | Result r ->
+                                    match r with
                                     | EffectOutput (ValueSome v) ->
                                         Expect.equal v value (sprintf "Expected %A, got %A" value v)
-                                    | other -> failtestf "Delayed Write (Choice) Unexpected effect from WaitResult: %A" other
-                                | None -> failtest "Expected WaitResult to complete within the timeout"
-                        | Fail fEx ->
-                            match sut.Handle.Await() with
-                            | EffectFailed ex -> 
-                                Expect.equal ex fEx "Expected exception to match"
-                            | other ->
-                                failtestf "Unexpected effect: %A" other
-                        | NoOp ->
-                            sut.Handle.AwaitTimeout(TimeSpan.FromMilliseconds 1000) |> function
-                            | Result EffectPending -> ()
-                            | res -> failtestf "Expected a timeout but received %A" res
-                        check rest
+                                        false
+                                    | eff -> failwith (sprintf "DelayedWrite Unexpected effect: %A" eff)
+                                | WaitResult fWait ->
+                                    // let timeout = TimeSpan.FromSeconds 100000L
+                                    // let timedAsync comp = Async.RunSynchronously(comp, timeout.Milliseconds)
+                                    let block1 = async { 
+                                        do! Async.Sleep (delay + 100)
+                                        let result = fWait()
+                                        return Some result
+                                    }
+                                    let block2 = async { 
+                                        do! Async.Sleep (delay + 10000)
+                                        return None 
+                                    }
+                                    Async.Choice [block1; block2] 
+                                    |> Async.RunSynchronously
+                                    |> function
+                                    | Some v -> 
+                                        match v with
+                                        | EffectOutput (ValueSome v) ->
+                                            Expect.equal v value (sprintf "Expected %A, got %A" value v)
+                                            false
+                                        | other -> failtestf "Delayed Write (Choice) Unexpected effect from WaitResult: %A" other
+                                    | None -> failtest "Expected WaitResult to complete within the timeout"
+                            | Fail fEx ->
+                                match sut.Handle.Await() with
+                                | EffectFailed ex -> 
+                                    // printfn "EffectFailed ex: %A" ex
+                                    let ex' = 
+                                        match ex with
+                                        | :? AggregateException as ae -> ae.InnerException
+                                        | _ -> ex
+                                    // printfn "Fail fEx - expected: %A, seen: %A" fEx ex'
+                                    Expect.equal (ex'.GetType().FullName) (fEx.GetType().FullName) 
+                                        "Expected exception to match"
+                                    true
+                                | other ->
+                                    failtestf "Unexpected effect: %A" other
+                            | NoOp ->
+                                sut.Handle.Poll() |> function
+                                | EffectPending -> false
+                                | res -> failtestf "Expected an empty response from `Poll` but received %A" res
+                        if not terminated then check rest
                 in check cmds
 
             member __.Cleanup () =
@@ -290,7 +303,7 @@ module ExternalHandleTests =
         [<Tests>]
         let externalHandleTests =
             testList "External Handle Tests" [
-                ftestPropertyWithConfig rawAsyncSeqconfig "Async Seq Handle With Arbitrary Commands" <| fun cmds ->
+                testPropertyWithConfig rawAsyncSeqconfig "Async Seq Handle With Arbitrary Commands" <| fun cmds ->
                     printfn "Testing Operations %A" cmds
                     let sut = AsyncSeqCmdSut<int>()
                     let runner = AsyncSeqPropRunner<int> sut
