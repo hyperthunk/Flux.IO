@@ -8,8 +8,42 @@ module Handles =
     open System.Threading
     open System.Threading.Tasks
 
+    exception AsyncStateException of string
+
     // TODO: this won't scale infinitely
     let mutable private atomicCounter = 0
+
+    [<AbstractClass>]
+    type internal BaseTaskHandle<'t>(bt : BackendToken<'t>) =
+        inherit EffectHandle<'t>(bt)
+
+        abstract member TaskRef : Task<'t>
+
+        override this.IsCompleted
+            with get (): bool = this.TaskRef.IsCompleted
+
+        override this.Poll() =
+            if this.TaskRef.IsCompletedSuccessfully then 
+                EffectOutput (ValueSome this.TaskRef.Result)
+            elif this.TaskRef.IsFaulted then
+                let ex =
+                    match this.TaskRef.Exception with
+                    | null -> null
+                    | ae when isNull ae.InnerException -> ae :> exn
+                    | ae -> ae.InnerException
+                if isNull ex then EffectFailed (Exception())
+                else EffectFailed ex
+            elif this.TaskRef.IsCanceled then 
+                EffectCancelled (OperationCanceledException())
+            else EffectPending
+
+        override this.Await() =
+            this.TaskRef.Wait()
+            this.Poll()
+
+        override this.AwaitTimeout ts =
+            this.TaskRef.Wait ts |> ignore 
+            this.Poll() |> Result
 
     let buildHandle<'T>
             (factory: unit -> Task<'T>) 
@@ -61,6 +95,38 @@ module Handles =
                 if not (isNull taskRef) then taskRef.Dispose()
                 cleanup()
         }
+
+    let internal tryWrap body =
+        try
+            body()
+        with
+        | :? AggregateException as ae ->
+            let ex =
+                if isNull ae.InnerException then (ae :> exn)
+                else ae.InnerException
+            EffectFailed ex
+        | :? OperationCanceledException as oce ->
+            EffectCancelled oce
+        | :? AsyncStateException ->
+            reraise()
+        | ex ->
+            EffectFailed ex
+    
+    let internal tryWaitableWrap body =
+        try
+            body()
+        with
+        | :? AggregateException as ae ->
+            let ex =
+                if isNull ae.InnerException then (ae :> exn)
+                else ae.InnerException
+            EffectFailed ex |> Result
+        | :? OperationCanceledException as oce ->
+            EffectCancelled oce |> Result
+        | :? AsyncStateException ->
+            reraise()
+        | ex ->
+            EffectFailed ex |> Result
 
 module Async =
 
@@ -117,8 +183,6 @@ module Async =
         WaitingReaders: ReaderQueue<'t>
         NextWaiterID: int
     }
-
-    exception AsyncStateException of string
 
     (* Reply to one of 3 channel types and maintain WaitingReaders:
         - Choice1Of3: normal AsyncReplyChannel
@@ -310,7 +374,7 @@ module Async =
 
         let mbox = startListener mboxToken
         
-        // NOT: synchronously enumerating can drive thread-pool exhaustion!
+        // NOTE: synchronously enumerating can drive thread-pool exhaustion!
 
         (* let hAsync = async {
             // let hEnum = enum.GetAsyncEnumerator workerToken.Token            
@@ -368,7 +432,6 @@ module Async =
                     with _ -> ()
         } in do Async.Start(hAsync, workerToken.Token)
 
-
         override __.IsCompleted = hResult.Task.IsCompleted
 
         override __.Poll() = 
@@ -376,7 +439,7 @@ module Async =
                hResult.Task.IsCompleted || 
                hResult.Task.IsFaulted then hResult.Task.Result
             else
-                mbox.PostAndReply (fun rc -> Dequeue rc)
+                mbox.PostAndReply Dequeue
 
         override __.Await (): EffectResult<'t> =
             let read =
@@ -393,9 +456,11 @@ module Async =
                     return Some res
                 }
 
-            match Async.Choice [ read; died ] |> Async.RunSynchronously with
-            | Some res -> res
-            | None -> raise (AsyncStateException "Invalid Async State (Await)")
+            tryWrap(fun() -> 
+                match Async.Choice [ read; died ] |> Async.RunSynchronously with
+                | Some res -> res
+                | None -> raise (AsyncStateException "Invalid Async State (Await)")
+            )
 
         override __.AwaitTimeout (arg: TimeSpan): WaitableResult<'t> = 
             let tcs = new TaskCompletionSource<EffectResult<'t>>()
@@ -420,20 +485,22 @@ module Async =
                     }
                 ]
 
-            mkAwaiters (int arg.TotalMilliseconds)
-            |> Async.Choice
-            |> Async.RunSynchronously
-            |> function
-            | Some res -> Result res
-            | None -> 
-                WaitResult (fun () -> 
-                    mkAwaiters -1
-                    |> Async.Choice
-                    |> Async.RunSynchronously
-                    |> function 
-                    | None -> failwithf "Invalid Async State"
-                    | Some rs -> rs
-                )
+            tryWaitableWrap(fun () ->
+                mkAwaiters (int arg.TotalMilliseconds)
+                |> Async.Choice
+                |> Async.RunSynchronously
+                |> function
+                | Some res -> Result res
+                | None -> 
+                    WaitResult (fun () -> 
+                        mkAwaiters -1
+                        |> Async.Choice
+                        |> Async.RunSynchronously
+                        |> function 
+                        | None -> failwithf "Invalid Async State"
+                        | Some rs -> rs
+                    )
+            )
             
         override __.Cancel (): unit = 
             workerToken.CancelAsync() |> ignore
@@ -462,16 +529,63 @@ module Async =
                 this.Dispose true
                 ValueTask.CompletedTask
 
-    type AsyncHandle<'t>(computation: Async<'t>) =
-        let x = 10
+    type internal AsyncHandle<'t>(computation : Async<'t>) =
+        inherit BaseTaskHandle<'t>(BackendToken computation)
+
+        let cts = new CancellationTokenSource()
+
+        let taskRef = Async.StartAsTask(computation, cancellationToken = cts.Token)
+        
+        override __.TaskRef = taskRef
+
+        override __.Cancel() = cts.Cancel()
+        
+        override this.CancelWait() = 
+            this.Cancel()
+            this.Await()
+        
+        override this.CancelWaitTimeout ts = 
+            this.Cancel()
+            this.AwaitTimeout ts
+
+        member internal __.Dispose(disposing: bool) =
+            if disposing then
+                taskRef.Dispose()
+                cts.Dispose()
+
+        interface IDisposable with
+            member this.Dispose (): unit = 
+                this.Dispose true
+                GC.SuppressFinalize this
+
+    type AsyncExtHandle<'t>(computation : Async<'t>) =
+        let ident = Interlocked.Increment(&atomicCounter)
+
+        let mutable started = new ManualResetEventSlim(false)
+
+        let mutable handle : AsyncHandle<'t> = Unchecked.defaultof<_>
+
+        member internal __.Dispose(disposing: bool) =
+            if disposing && started.IsSet then
+                started.Dispose()
+                handle.Dispose true
 
         interface ExternalHandle<'t> with
-            member _.Id = Interlocked.Increment(&atomicCounter)
-            member _.Class = EffectExternal typeof<Task<'t>>.FullName
-            member _.IsStarted = false
-            member _.IsCompleted = false
-            member _.Start() = failwith "Not implemented"
-            member _.Dispose() = ()
+            member __.Id = ident
+            member __.Class = EffectAsync
+            member __.IsStarted = started.IsSet
+            member __.IsCompleted = started.IsSet && handle.IsCompleted
+            member __.Start() =
+                if started.IsSet then
+                    handle
+                else
+                    handle <- new AsyncHandle<'t>(computation)
+                    started.Set()
+                    handle            
+
+            member this.Dispose() = 
+                this.Dispose true
+                GC.SuppressFinalize this
 
     (* let startSingleOutlet<'T> (block: Async<'T>) : EffectOutlet<'T> = 
         let hMbox = MailboxProcessor.Start(fun mbox -> async {
