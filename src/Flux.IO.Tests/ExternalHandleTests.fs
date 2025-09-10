@@ -127,9 +127,11 @@ module ExternalHandleTests =
                 if cmd = Cancel then
                     hAsync.Value.CancelWait() |> Some 
                 elif chWorker.IsSome then
-                    let success = chWorker.Value.Writer.TryWrite (Choice1Of2 cmd) 
-                    if not success then failwith "Failed to write command to channel"
-                    else None
+                    // Respect backpressure: if the bounded channel is full, block until space is available.
+                    let writer = chWorker.Value.Writer
+                    if not (writer.TryWrite (Choice1Of2 cmd)) then
+                        writer.WriteAsync(Choice1Of2 cmd).AsTask().Wait()
+                    None
                 else None
 
             member __.Dispose () = 
